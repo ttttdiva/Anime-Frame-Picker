@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0d0d13">
+  <title>ANIME FRAME PICKER</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-lockup">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div>
+          <div class="eyebrow">LOCAL VISION LAB</div>
+          <h1>ANIME FRAME PICKER</h1>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <div id="modelStatus" class="status-pill status-loading"><span class="status-dot"></span><span>モデル確認中</span></div>
+        <button id="shortcutButton" class="icon-button" type="button" title="キーボードショートカット" aria-label="キーボードショートカット">?</button>
+      </div>
+    </header>
+
+    <div id="globalNotice" class="global-notice hidden" role="status"></div>
+
+    <main class="workspace">
+      <aside class="left-rail panel-stack" aria-label="入力設定">
+        <section class="panel source-panel">
+          <div class="panel-heading">
+            <div>
+              <div class="section-kicker">01 / SOURCE</div>
+              <h2>映像を選ぶ</h2>
+            </div>
+            <span class="step-badge">INPUT</span>
+          </div>
+          <label class="field-label" for="videoSelect">ローカル動画</label>
+          <div class="select-wrap">
+            <select id="videoSelect" aria-label="動画を選択">
+              <option value="">読み込み中…</option>
+            </select>
+          </div>
+          <div class="or-divider"><span>または</span></div>
+          <label class="file-drop compact" for="videoFile">
+            <input id="videoFile" type="file" accept="video/mp4,video/x-matroska,.mp4,.mkv">
+            <span class="file-icon" aria-hidden="true">↥</span>
+            <span><strong>動画ファイルを追加</strong><small>MP4 / MKV · ローカルのみ</small></span>
+          </label>
+          <div id="videoMeta" class="meta-card muted">動画を選択すると情報が表示されます</div>
+          <video id="videoPreview" class="video-preview hidden" controls preload="metadata"></video>
+        </section>
+
+        <section class="panel reference-panel">
+          <div class="panel-heading">
+            <div>
+              <div class="section-kicker">02 / REFERENCE</div>
+              <h2>探したい対象</h2>
+            </div>
+            <span id="referenceCount" class="count-badge">0</span>
+          </div>
+          <p class="panel-help">顔・キャラクターなど、同一対象の参照画像を1枚以上登録します。</p>
+          <label class="file-drop" for="referenceFiles">
+            <input id="referenceFiles" type="file" accept="image/*" multiple>
+            <span class="file-icon" aria-hidden="true">＋</span>
+            <span><strong>参照画像を追加</strong><small>複数選択可 · JPG / PNG / WebP</small></span>
+          </label>
+          <div class="timestamp-row">
+            <label class="field-label" for="referenceTime">動画から切り出す</label>
+            <div class="inline-controls">
+              <input id="referenceTime" class="number-input" type="number" min="0" step="0.1" value="0" aria-label="参照画像の時刻（秒）">
+              <span class="unit">秒</span>
+              <button id="captureReference" class="ghost-button" type="button" disabled>この時刻を取得</button>
+            </div>
+          </div>
+          <div id="referenceList" class="reference-list empty-state">参照画像がありません</div>
+        </section>
+
+        <section class="panel tag-panel">
+          <div class="panel-heading">
+            <div>
+              <div class="section-kicker">03 / TAGS</div>
+              <h2>シーンの条件</h2>
+            </div>
+          </div>
+          <p class="panel-help tag-help">一般タグ（表情・ポーズ・構図）の条件を、対象cropかフレーム全体に適用します。</p>
+          <div class="tag-intent-tabs" role="tablist" aria-label="タグ条件">
+            <button id="wantedTab" class="tag-tab active" type="button" role="tab" aria-selected="true">欲しい</button>
+            <button id="avoidedTab" class="tag-tab" type="button" role="tab" aria-selected="false">避けたい</button>
+          </div>
+          <div class="tag-search-wrap">
+            <span class="search-glyph" aria-hidden="true">⌕</span>
+            <input id="tagSearch" type="search" autocomplete="off" placeholder="例：笑顔、横顔、夜…" aria-label="タグを検索">
+            <span id="tagSearchSpinner" class="mini-spinner hidden" aria-hidden="true"></span>
+          </div>
+          <div class="scope-row" role="group" aria-label="タグの適用範囲">
+            <span class="scope-label">適用範囲</span>
+            <button class="scope-button active" data-scope="subject" type="button" title="参照画像から指定した対象cropに適用">対象 crop</button>
+            <button class="scope-button" data-scope="frame" type="button" title="映像のフレーム全体に適用">フレーム全体</button>
+          </div>
+          <div id="tagSuggestions" class="tag-suggestions hidden" role="listbox"></div>
+          <div id="tagWarning" class="inline-warning hidden" role="alert"></div>
+          <div class="tag-bucket">
+            <div class="bucket-title"><span id="bucketTitle">欲しいタグ</span><span id="wantedCount" class="subtle-count">0</span></div>
+            <div id="wantedTags" class="chips"><span class="chips-empty">検索結果から追加できます</span></div>
+          </div>
+          <div class="tag-bucket avoided-bucket">
+            <div class="bucket-title"><span>避けたいタグ</span><span id="avoidedCount" class="subtle-count">0</span></div>
+            <div id="avoidedTags" class="chips"><span class="chips-empty">必要なときだけ追加</span></div>
+          </div>
+        </section>
+      </aside>
+
+      <section class="center-stage" aria-label="参照範囲と解析結果">
+        <section class="panel crop-panel">
+          <div class="panel-heading crop-heading">
+            <div>
+              <div class="section-kicker">TARGET AREA</div>
+              <h2>対象範囲を指定</h2>
+            </div>
+            <div class="crop-actions">
+              <span id="cropReadout" class="readout">全体を使用</span>
+              <button id="resetCrop" class="text-button" type="button">全体に戻す</button>
+            </div>
+          </div>
+          <div id="cropEmpty" class="canvas-empty">
+            <div class="empty-icon" aria-hidden="true">▧</div>
+            <strong>参照画像を選択してください</strong>
+            <span>左のパネルから画像を追加すると、ここで対象範囲をドラッグできます。</span>
+          </div>
+          <div id="cropStage" class="crop-stage hidden">
+            <canvas id="referenceCanvas" aria-label="参照画像の対象範囲選択"></canvas>
+            <div class="crop-hint">ドラッグして対象範囲を選択 · クリックで全体</div>
+          </div>
+          <div id="selectedReferenceName" class="selected-reference hidden"></div>
+        </section>
+
+        <section id="resultsPanel" class="panel results-panel">
+          <div class="panel-heading results-heading">
+            <div>
+              <div class="section-kicker">04 / RESULTS</div>
+              <h2>候補フレーム</h2>
+            </div>
+            <div class="results-actions">
+              <span id="resultCount" class="result-count">0件</span>
+              <button id="clearSelection" class="text-button" type="button" disabled>選択解除</button>
+              <button id="compareButton" class="ghost-button" type="button" disabled>2枚を比較</button>
+              <button id="exportButton" class="primary-button small" type="button" disabled>選択を書き出す</button>
+            </div>
+          </div>
+          <div id="progressArea" class="progress-area hidden" aria-live="polite">
+            <div class="progress-topline"><span id="progressMessage">解析中…</span><span id="progressPercent">0%</span></div>
+            <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+            <button id="cancelJob" class="text-button danger" type="button">解析をキャンセル</button>
+          </div>
+          <div id="shortageNotice" class="shortage-notice hidden" role="status"></div>
+          <div id="resultsEmpty" class="results-empty">
+            <div class="results-empty-orb" aria-hidden="true"><span></span><span></span><span></span></div>
+            <strong>候補はここに表示されます</strong>
+            <span>入力と参照範囲を確認して、解析を開始してください。</span>
+          </div>
+          <div id="resultsGrid" class="results-grid hidden" aria-live="polite"></div>
+        </section>
+      </section>
+
+      <aside class="right-rail panel-stack" aria-label="解析設定">
+        <section class="panel analyze-panel">
+          <div class="panel-heading">
+            <div>
+              <div class="section-kicker">ANALYZE</div>
+              <h2>解析を実行</h2>
+            </div>
+            <span id="readyBadge" class="ready-badge">準備中</span>
+          </div>
+          <div class="analyze-summary">
+            <div><span>動画</span><strong id="summaryVideo">未選択</strong></div>
+            <div><span>参照</span><strong id="summaryReference">0枚</strong></div>
+            <div><span>条件</span><strong id="summaryTags">0件</strong></div>
+          </div>
+          <button id="analyzeButton" class="primary-button analyze-button" type="button"><span class="play-icon">▶</span>解析を開始</button>
+          <p class="privacy-note"><span class="lock-icon" aria-hidden="true">⌑</span> 画像と動画はこのPC上で処理されます。外部へ送信しません。</p>
+        </section>
+
+        <section class="panel logo-panel" aria-labelledby="logoRemovalTitle">
+          <div class="panel-heading">
+            <div>
+              <div class="section-kicker">EXPORT CLEANUP</div>
+              <h2 id="logoRemovalTitle">ロゴ除去</h2>
+            </div>
+            <span id="logoModelBadge" class="ready-badge">確認中</span>
+          </div>
+          <div class="logo-controls">
+            <label class="check-row logo-check-row" for="logoRemovalToggle">
+              <input id="logoRemovalToggle" type="checkbox" checked>
+              <span class="checkmark"></span>
+              <span>保存時にロゴを除去</span>
+            </label>
+            <label class="field-label logo-profile-label" for="logoProfileSelect">ロゴプロファイル</label>
+            <div class="select-wrap logo-profile-wrap">
+              <select id="logoProfileSelect" aria-describedby="logoProfileHint">
+                <option value="">自動（登録済みから検出）</option>
+              </select>
+            </div>
+            <p id="logoProfileHint" class="logo-hint">指定領域をAI補完します。元フレームも保存します。解析と候補表示は元の映像です。</p>
+            <p id="logoProfileStatus" class="logo-profile-status" role="status"></p>
+            <a id="logoProfileEmpty" class="logo-profile-empty hidden" href="/static/logo-help.html" target="_blank" rel="noopener">ロゴ未登録: 新しいロゴはSkillで登録</a>
+          </div>
+        </section>
+
+        <details class="panel settings-panel" open>
+          <summary class="panel-heading settings-summary">
+            <div>
+              <div class="section-kicker">SETTINGS</div>
+              <h2>探索パラメータ</h2>
+            </div>
+            <span class="chevron" aria-hidden="true">⌄</span>
+          </summary>
+          <div class="settings-body">
+            <div class="range-row">
+              <label class="field-label" for="startTime">探索区間 <span class="label-hint">秒</span></label>
+              <div class="two-inputs"><input id="startTime" type="number" min="0" step="0.1" value="0"><span>–</span><input id="endTime" type="number" min="0" step="0.1" value="0"><span class="unit">（0 = 最後まで）</span></div>
+            </div>
+            <div class="field-grid">
+              <label><span>粗い間隔 <em>coarse</em></span><div class="input-with-unit"><input id="coarseStep" type="number" min="0.1" step="0.1" value="2"><span>秒</span></div></label>
+              <label><span>細かい間隔 <em>dense</em></span><div class="input-with-unit"><input id="denseStep" type="number" min="0.01" step="0.01" value="0.25"><span>秒</span></div></label>
+              <label><span>候補数 <em>20–50</em></span><input id="candidateCount" type="number" min="20" max="50" step="1" value="30"></label>
+              <label><span>感度 <em>identity</em></span><input id="identityThreshold" type="number" min="0" max="1" step="0.001" value="0.213231"></label>
+              <label><span>タグ閾値 <em>一般タグの条件</em></span><input id="tagThreshold" type="number" min="0" max="1" step="0.01" value="0.17" title="一般タグの条件に使う信頼度の下限"></label>
+              <label><span>品質下限</span><input id="qualityMin" type="number" min="0" max="1" step="0.01" value="0.15"></label>
+            </div>
+            <label class="check-row"><input id="rescue" type="checkbox" checked><span class="checkmark"></span><span>不足時の救済探索を有効にする</span></label>
+            <div class="weight-heading"><span>スコア重み</span><span class="weight-total" id="weightTotal">1.00</span></div>
+            <div class="weight-grid">
+              <label><span>同一性</span><input id="identityWeight" type="number" min="0" max="1" step="0.05" value="0.35"></label>
+              <label><span>状態</span><input id="conditionWeight" type="number" min="0" max="1" step="0.05" value="0.3"></label>
+              <label><span>画質</span><input id="qualityWeight" type="number" min="0" max="1" step="0.05" value="0.35"></label>
+            </div>
+          </div>
+        </details>
+
+        <section class="panel evidence-panel">
+          <div class="panel-heading compact-heading">
+            <div>
+              <div class="section-kicker">EVIDENCE</div>
+              <h2>選択中のフレーム</h2>
+            </div>
+            <span id="selectedCount" class="count-badge">0</span>
+          </div>
+          <div id="evidenceEmpty" class="evidence-empty">候補を選ぶと、ここに詳細が表示されます。</div>
+          <div id="evidenceDetail" class="evidence-detail hidden">
+            <div class="evidence-viewer">
+              <div class="evidence-image-wrap"><img id="evidenceImage" alt="選択した候補フレーム"><div id="evidenceBox" class="bbox-overlay"></div></div>
+              <img id="evidenceCrop" class="evidence-crop" alt="対象の切り抜き">
+              <div class="evidence-nav"><button id="prevCandidate" type="button" aria-label="前の候補">‹</button><span id="evidencePosition">1 / 1</span><button id="nextCandidate" type="button" aria-label="次の候補">›</button></div>
+              <button id="evidenceEnlarge" class="evidence-enlarge-button" type="button" disabled>拡大表示</button>
+            </div>
+            <div id="evidenceMeta" class="evidence-meta"></div>
+          </div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <div id="compareModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="compareTitle">
+    <div class="modal-backdrop" data-close-modal="true"></div>
+    <div class="modal-card compare-card">
+      <div class="modal-header"><div><div id="compareKicker" class="section-kicker">COMPARE</div><h2 id="compareTitle">2枚を比較</h2></div><button class="close-button" type="button" data-close-modal="true" aria-label="閉じる">×</button></div>
+      <div id="compareContent" class="compare-content"></div>
+    </div>
+  </div>
+
+  <div id="shortcutModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="shortcutTitle">
+    <div class="modal-backdrop" data-close-modal="true"></div>
+    <div class="modal-card shortcut-card">
+      <div class="modal-header"><div><div class="section-kicker">SHORTCUTS</div><h2 id="shortcutTitle">キーボード操作</h2></div><button class="close-button" type="button" data-close-modal="true" aria-label="閉じる">×</button></div>
+      <div class="shortcut-list"><div><kbd>←</kbd><kbd>→</kbd><span>候補を移動</span></div><div><kbd>Space</kbd><span>現在の候補を選択</span></div><div><kbd>Esc</kbd><span>検索・ダイアログを閉じる</span></div></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

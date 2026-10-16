@@ -1,0 +1,48 @@
+# Local inputs and generated outputs
+source/*
+!source/.gitkeep
+*.mp4
+*.mkv
+*.webm
+*.vtt
+*.srt
+outputs/
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# Python and the isolated runtime
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model downloads and local caches
+.cache/
+.hf/
+models/
+model-cache/
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.bin
+
+# Runtime logs and local configuration
+logs/
+.local/
+*.log
+.env
+.env.*
+!.env.example
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

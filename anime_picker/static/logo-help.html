@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ロゴプロファイル登録 | ANIME FRAME PICKER</title>
+  <style>
+    :root { color-scheme: dark; --bg: #0b0b10; --panel: #15151e; --line: #2a2938; --text: #f1f0f7; --soft: #b2afc1; --muted: #898497; --purple: #c4a6ff; --mint: #70d9c2; --amber: #f1b56c; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 55% 0, rgba(110,73,178,.14), transparent 32rem), var(--bg); color: var(--text); font: 14px/1.65 "Yu Gothic UI", "Meiryo UI", "Segoe UI", sans-serif; }
+    main { width: min(860px, calc(100% - 32px)); margin: 0 auto; padding: 42px 0 64px; }
+    .eyebrow { color: var(--purple); font-size: 11px; letter-spacing: .16em; font-weight: 700; }
+    h1 { margin: 7px 0 10px; font-size: 25px; line-height: 1.25; }
+    h2 { margin: 0 0 8px; font-size: 16px; }
+    p { margin: 7px 0; color: var(--soft); }
+    .intro { max-width: 720px; margin-bottom: 24px; }
+    section { margin-top: 16px; padding: 19px 21px 21px; border: 1px solid var(--line); border-radius: 13px; background: linear-gradient(145deg, rgba(26,25,36,.98), rgba(16,16,23,.98)); }
+    ol { margin: 10px 0 0 21px; padding: 0; color: var(--soft); }
+    li + li { margin-top: 8px; }
+    code { color: var(--mint); font-family: Consolas, "Cascadia Code", monospace; font-size: .92em; }
+    pre { margin: 11px 0 0; overflow-x: auto; padding: 12px 14px; border: 1px solid #252435; border-radius: 8px; background: #08080d; color: #d9d3ed; font: 12px/1.6 Consolas, "Cascadia Code", monospace; white-space: pre-wrap; }
+    .note { border-left: 3px solid var(--amber); padding-left: 11px; }
+    .local { color: var(--mint); }
+    .path { overflow-wrap: anywhere; }
+    footer { margin-top: 18px; color: var(--muted); font-size: 12px; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">LOCAL LOGO PROFILE</div>
+    <h1>ロゴプロファイルを登録する</h1>
+    <p class="intro">新しい固定ロゴは、未加工のネイティブフレームからローカルプロファイルとして登録します。プロファイルが無いロゴや一致しないフレームは除去せず、元フレームを保持します。</p>
+
+    <section>
+      <h2>まずSkillを呼び出す</h2>
+      <p>このリポジトリでCodexに <code>$anime-logo-profile</code> を呼び出してください。手順の正本は <code class="path">.agents/skills/anime-logo-profile/SKILL.md</code> です。プロファイル、テンプレート、マスクは <code>.local/logo-profiles/</code> に保存するプライベートなローカル資産です。</p>
+      <p class="note">実行時に動画や画像を外部へ送信したり、未知のロゴを推測したりしません。未加工の元フレームを入力に使い、処理済みプレビューをプロファイル入力へ戻さないでください。</p>
+    </section>
+
+    <section>
+      <h2>登録とキャリブレーション</h2>
+      <ol>
+        <li>未加工のネイティブPNGを1枚用意し、ロゴを含む周辺の <code>ROI</code> と、変更を許すロゴだけの <code>mask</code> を測ります。</li>
+        <li>プロファイルを作成します。座標は元フレーム全体のピクセル座標です。</li>
+      </ol>
+      <pre>.venv\Scripts\python.exe scripts\logo_profiles.py create `
+  --id hi-anime --name "hi!anime.at" `
+  --image .cache\qa\frame-20s.png `
+  --roi 1440 0 1920 256 --mask-rect 1718 18 1910 72</pre>
+      <ol start="3">
+        <li>未加工のロゴ有り・ロゴ無しフレームを実際に確認し、検出閾値を提案させます。書き込みは明示的に指定します。</li>
+      </ol>
+      <pre>.venv\Scripts\python.exe scripts\logo_profiles.py calibrate `
+  --profile muse --video "source\episode.mp4" `
+  --positive-time 110 --negative-time 20 --negative-time 70 `
+  --write --overwrite</pre>
+      <p>上の有無の時刻は今回のEpisode 1のMUSE用です。hi!anime.atはこれらの時刻にも存在します。別のロゴでは、実画像で有無を確認してプロファイル名と時刻を置き換えてください。</p>
+      <p>作成された資産は <code class="path">.local/logo-profiles/hi-anime/</code> の <code>profile.json</code>、<code>reference.png</code>、<code>template.png</code>（必要なら <code>mask.png</code>）です。</p>
+    </section>
+
+    <section>
+      <h2>確認してから使う</h2>
+      <p>一覧、検出プレビュー、境界検証を順に実行します。</p>
+      <pre>.venv\Scripts\python.exe scripts\logo_profiles.py list
+
+.venv\Scripts\python.exe scripts\logo_profiles.py preview `
+  --profile hi-anime --video "source\episode.mp4" --time 20 `
+  --out .cache\logo-preview\hi-anime-20s
+
+.venv\Scripts\python.exe scripts\logo_profiles.py verify `
+  --profile muse --video "source\episode.mp4" `
+  --present-time 110 --absent-time 20 --absent-time 70 `
+  --out .cache\logo-verify\muse --overwrite</pre>
+      <p>通常の <code>preview</code> は準備済みのローカルモデルとGPUを使います。検出だけなら <code>preview --dry</code>、キャリブレーションと <code>verify</code> はCPUで実行できます。検証では、元の解像度・PTSと、マスク外の画素が保持されることを確認します。</p>
+      <p>CPUの <code>verify</code> は検出とマスクの検査です。実際の補完品質はGPUの <code>preview</code> で生成した補完前後の画像を目視して確認します。PTSを指定する場合は動画から取得した実値を使い、時刻から推測しないでください。</p>
+      <p class="note">モデル準備は別の明示操作です。必要なときだけ次を実行してください。</p>
+      <pre>.venv\Scripts\python.exe -m anime_picker.logo_removal prepare</pre>
+    </section>
+
+    <footer>すべてのコマンドはこのPC内で実行されます。ロゴ位置や形が変わった作品には新しいプロファイルを作り、再キャリブレーションしてください。</footer>
+  </main>
+</body>
+</html>

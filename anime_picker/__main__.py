@@ -43,6 +43,12 @@ def _serve(args: argparse.Namespace) -> int:
     # Import only after parsing so `--help` and `doctor` remain cheap and safe.
     from .server import app
 
+    # Verify the sealed accepted catalogue in the background so the first
+    # "Accepted frames" request does not pay the full hash/path validation.
+    catalogue = getattr(app.state, "accepted_catalogue", None)
+    if catalogue is not None:
+        threading.Thread(target=catalogue.prewarm, name="accepted-catalogue-prewarm", daemon=True).start()
+
     url = f"http://{args.host}:{args.port}/"
     if not args.no_browser:
         # The browser is explicitly user-facing for an interactive `serve`

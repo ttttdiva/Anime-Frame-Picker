@@ -10,8 +10,10 @@ therefore safe for the CLI, tests, and the offline browser UI.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import inspect
+import io
 import json
 import math
 import mimetypes
@@ -25,12 +27,17 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from .output_layout import default_state_root, publication_state_root, publish_image_set, register_public_receipts, video_output_directory
+from . import exclusion
+from . import run_manifest as runs
+from .accepted_catalogue import AcceptedCatalogue, CatalogueError
+from .character_candidates import KEY_PATTERN, CharacterCandidateIndex, detection_key, embed_crops, model_threshold
 
 try:  # Pillow is present in the supported local runtime.
     from PIL import Image
@@ -49,6 +56,9 @@ CACHE_ROOT = Path(os.environ.get("ANIME_PICKER_CACHE", str(PACKAGE_ROOT / ".cach
 REFERENCE_ROOT = CACHE_ROOT / "references"
 RESULT_ROOT = CACHE_ROOT / "results"
 UPLOAD_ROOT = CACHE_ROOT / "uploads"
+# Private run manifests (selection + analysis settings) for resume/rerun.
+RUN_ROOT = CACHE_ROOT / "runs"
+CHARACTER_KEY_RE = re.compile(rf"^{KEY_PATTERN}$")
 
 # Keep the public defaults stable.  The export root is resolved from the
 # repository location so direct launches do not depend on their current
@@ -94,16 +104,20 @@ LOGO_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 MAX_UPLOAD_BYTES = int(os.environ.get("ANIME_PICKER_MAX_UPLOAD_BYTES", str(8 * 1024**3)))
 MAX_REFERENCE_BYTES = int(os.environ.get("ANIME_PICKER_MAX_REFERENCE_BYTES", str(100 * 1024**2)))
 MAX_STATIC_BYTES = int(os.environ.get("ANIME_PICKER_MAX_STATIC_BYTES", str(20 * 1024**2)))
+MAX_SUGGESTION_PAGE_FRAMES = 12
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "start": 0.0,
     "end": 0.0,
     "coarse_step": 2.0,
+    "auto_sample_step": 1.0,
     "dense_step": 0.25,
-    "candidate_count": 30,
+    # Zero means show every candidate found by the character search.
+    "candidate_count": 0,
     "identity_threshold": 0.213231,
     "tag_threshold": 0.17,
     "quality_min": 0.15,
+    "cut_quality_min": 0.55,
     "rescue": True,
     "identity_weight": 0.35,
     "condition_weight": 0.30,
@@ -219,6 +233,7 @@ class VideoRecord:
     info: dict[str, Any]
     fingerprint: str
     created_at: str
+    display_name: str | None = None
 
 
 @dataclass
@@ -251,12 +266,21 @@ class JobRecord:
     result_root: Path | None = None
     model_revision: Any = None
     created_at: str = field(default_factory=lambda: _utc_now())
+    run: dict[str, Any] = field(default_factory=dict)
 
 
 VIDEO_REGISTRY: dict[str, VideoRecord] = {}
 REFERENCE_REGISTRY: dict[str, ReferenceRecord] = {}
 JOB_REGISTRY: dict[str, JobRecord] = {}
+# Candidate-character groups per source fingerprint for the selection screen.
+SUGGESTION_INDEX: dict[str, CharacterCandidateIndex] = {}
 _STATE_LOCK = threading.RLock()
+# One lock per UI run id: the live-job check, manifest handling and job
+# registration for a run happen under it, so identical concurrent submissions
+# can never start two jobs for one run. RUN_OWNERS names the single job that
+# may write a run's manifest (a superseded, cancelling job must not).
+RUN_LOCKS: dict[str, threading.RLock] = {}
+RUN_OWNERS: dict[str, str] = {}
 _GPU_LOCK = threading.Lock()
 _EXECUTOR: ThreadPoolExecutor | None = None
 _MODEL_INSTANCE: Any = None
@@ -327,6 +351,14 @@ def _fingerprint(path: Path) -> str:
             digest.update(chunk)
     stat = path.stat()
     return f"sha256:{digest.hexdigest()}:size:{stat.st_size}:mtime_ns:{stat.st_mtime_ns}"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _check_video_path(path_value: str | os.PathLike[str]) -> Path:
@@ -490,7 +522,12 @@ def _reader_fingerprint(path: Path) -> str:
     return _fingerprint(path)
 
 
-def _register_video(path: Path, info: dict[str, Any] | None = None) -> VideoRecord:
+def _register_video(
+    path: Path,
+    info: dict[str, Any] | None = None,
+    *,
+    display_name: str | None = None,
+) -> VideoRecord:
     resolved = path.resolve(strict=True)
     info = info or _extract_video_info(resolved)
     fingerprint = _reader_fingerprint(resolved)
@@ -500,6 +537,8 @@ def _register_video(path: Path, info: dict[str, Any] | None = None) -> VideoReco
                 if existing.path.resolve() == resolved:
                     existing.info.update(info)
                     existing.fingerprint = fingerprint
+                    if display_name:
+                        existing.display_name = display_name
                     return existing
             except OSError:
                 continue
@@ -509,6 +548,7 @@ def _register_video(path: Path, info: dict[str, Any] | None = None) -> VideoReco
             info=info,
             fingerprint=fingerprint,
             created_at=_utc_now(),
+            display_name=display_name or resolved.name,
         )
         VIDEO_REGISTRY[record.id] = record
         return record
@@ -1092,6 +1132,249 @@ def _detection_box(model: Any, image: Any) -> list[float]:
         return _expand_box(normalized_box(heads[0]))
 
 
+def _character_detection_records(model: Any, image: Any) -> list[dict[str, Any]]:
+    """Keep detector-backed person/head crops; do not infer identity groups."""
+
+    detect = getattr(model, "detect", None)
+    if not callable(detect):
+        raise RuntimeError("GPU model service does not provide person/head detection")
+    raw = detect(image) or []
+    eligible = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            score = float(item.get("score", item.get("confidence", 0.0)))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        # ModelService's detector thresholds are 0.30. Keep that same floor
+        # while rejecting malformed/very weak boxes before they reach the UI.
+        if not math.isfinite(score) or score < 0.30:
+            continue
+        eligible.append(item)
+    try:
+        from scripts.batch_source import character_boxes
+    except Exception as exc:
+        raise RuntimeError(f"existing character-box selector is unavailable: {exc}") from exc
+    selected = character_boxes(eligible, image.size, None)
+    width, height = image.size
+    result: list[dict[str, Any]] = []
+    for box, score, kind in selected:
+        normalized = [float(box[0]) / width, float(box[1]) / height, float(box[2]) / width, float(box[3]) / height]
+        result.append({"box": normalized, "score": float(score), "kind": str(kind)})
+    return result
+
+
+def _local_identity_manifest() -> Mapping[str, Any] | None:
+    try:
+        manifest = json.loads((DEFAULT_MODEL_ROOT / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return manifest if isinstance(manifest, Mapping) else None
+
+
+def _archived_character_frames(video: VideoRecord) -> list[dict[str, Any]]:
+    """Read exact-source detector+CCIP records from archived batch metadata."""
+
+    archive_root = DEFAULT_OUTPUT_ROOT / "_archive"
+    manifest = _local_identity_manifest()
+    if not archive_root.is_dir() or manifest is None:
+        return []
+    current_revision = manifest.get("revision")
+    current_identity_model = manifest.get("identity_model")
+    if not isinstance(current_revision, str) or not current_revision or not isinstance(current_identity_model, str) or not current_identity_model:
+        return []
+    frames: list[dict[str, Any]] = []
+    for metadata_path in sorted(archive_root.glob("*/batch/*/character_*/metadata.json"), key=lambda path: os.fspath(path).casefold()):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(metadata, Mapping) or metadata.get("source_fingerprint") != video.fingerprint:
+            continue
+        stats = metadata.get("stats")
+        if not isinstance(stats, Mapping):
+            continue
+        try:
+            detector_count = int(stats.get("detections", 0) or 0)
+            identity_count = int(stats.get("identity_matches", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        identity_model = str(stats.get("identity_model", ""))
+        model_revision = str(stats.get("model_revision", ""))
+        if (
+            detector_count < 1
+            or identity_count < 1
+            or identity_model != current_identity_model
+            or model_revision != current_revision
+        ):
+            continue
+        for candidate in metadata.get("exports", []) if isinstance(metadata.get("exports"), list) else []:
+            if not isinstance(candidate, Mapping):
+                continue
+            pts = candidate.get("pts")
+            time_value = candidate.get("time")
+            bbox = candidate.get("bbox")
+            identity = candidate.get("identity")
+            distance = candidate.get("distance")
+            if type(pts) is not int or type(time_value) not in (int, float) or not math.isfinite(float(time_value)):
+                continue
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+            try:
+                box = [float(value) for value in bbox]
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not (all(math.isfinite(value) for value in box) and 0.0 <= box[0] < box[2] <= 1.0 and 0.0 <= box[1] < box[3] <= 1.0):
+                continue
+            if type(identity) not in (int, float) or type(distance) not in (int, float) or not math.isfinite(float(identity)) or not math.isfinite(float(distance)):
+                continue
+            frame = next((item for item in frames if item["pts"] == pts), None)
+            if frame is None:
+                frame = {"pts": pts, "time": float(time_value), "detections": []}
+                frames.append(frame)
+            frame["detections"].append({"box": box, "score": None, "kind": "cached_crop"})
+            frame["source"] = "archived_detector_ccip"
+    frames.sort(key=lambda item: (float(item["time"]), int(item["pts"])))
+    for frame in frames:
+        frame["preview_url"] = f"/api/videos/{video.id}/frame-preview?pts={int(frame['pts'])}"
+    return frames
+
+
+def _suggestion_index(video: VideoRecord, *, reset: bool = False, threshold: float | None = None) -> CharacterCandidateIndex:
+    with _STATE_LOCK:
+        index = SUGGESTION_INDEX.get(video.fingerprint)
+        if index is None or reset:
+            index = CharacterCandidateIndex(video.fingerprint, threshold=threshold)
+            SUGGESTION_INDEX[video.fingerprint] = index
+        elif threshold is not None:
+            index.threshold = float(threshold)
+        return index
+
+
+def _member_preview_url(video: VideoRecord) -> Callable[[Mapping[str, Any]], str]:
+    def build(member: Mapping[str, Any]) -> str:
+        box = ",".join(f"{float(value):.4f}" for value in member["box"])
+        return f"/api/videos/{video.id}/frame-preview?pts={int(member['pts'])}&box={box}"
+
+    return build
+
+
+def _index_frames(index: CharacterCandidateIndex, frames: list[dict[str, Any]], features: Any, distance: Any) -> None:
+    """Assign stable detection/character keys to every returned detection."""
+
+    records: list[dict[str, Any]] = []
+    for frame in frames:
+        for detection in frame["detections"]:
+            detection["detection_key"] = detection_key(index.fingerprint, int(frame["pts"]), detection["box"])
+            records.append({
+                "detection_key": detection["detection_key"],
+                "pts": int(frame["pts"]),
+                "time": float(frame["time"]),
+                "box": detection["box"],
+                "score": detection.get("score"),
+                "kind": detection.get("kind", "person"),
+            })
+    keys = index.add(records, features, distance)
+    position = 0
+    for frame in frames:
+        for detection in frame["detections"]:
+            detection["character_key"] = keys[position]
+            position += 1
+
+
+def _exclusion_conflict(exc: Exception) -> HTTPException:
+    return HTTPException(status_code=409, detail=str(exc))
+
+
+def _refuse_conflicting_start(video: VideoRecord, *, output_root: Path | None = None, gpu: bool = True) -> None:
+    """Refuse to start work another process is (or may be) already doing.
+
+    Batches started before cross-process locking hold no lock, so they are
+    found from the process list. GPU work conflicts with any of them; a
+    public-image write only with one writing the same output root.
+    """
+
+    try:
+        exclusion.ensure_no_legacy_batch(PACKAGE_ROOT, None if gpu else output_root)
+        if exclusion.video_busy(PACKAGE_ROOT, video.fingerprint):
+            raise exclusion.ExclusionBusy("this video is being processed by another process (batch or UI)")
+    except exclusion.ExclusionBusy as exc:
+        raise _exclusion_conflict(exc) from exc
+
+
+@contextlib.contextmanager
+def _video_exclusion(video: VideoRecord, *, output_root: Path | None = None, gpu: bool = True) -> Iterator[None]:
+    """Hold the cross-process video lease for one stage of UI work."""
+
+    try:
+        exclusion.ensure_no_legacy_batch(PACKAGE_ROOT, None if gpu else output_root)
+        with exclusion.video_lease(PACKAGE_ROOT, video.fingerprint, f"ui:{os.getpid()}"):
+            yield
+    except exclusion.ExclusionBusy as exc:
+        raise _exclusion_conflict(exc) from exc
+
+
+def _suggest_character_frames(video: VideoRecord, times: list[float], index: CharacterCandidateIndex | None = None) -> dict[str, Any]:
+    """Detect characters only at requested page samples; never fall back to CPU.
+
+    Detector crops are grouped into candidate characters with the existing
+    CCIP embed/distance contract and official threshold (no new model).
+    """
+
+    if not _GPU_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="the GPU model is busy with another character job; retry after it finishes")
+    try:
+        try:
+            exclusion.ensure_no_legacy_batch(PACKAGE_ROOT)
+            if exclusion.gpu_busy(PACKAGE_ROOT):
+                raise exclusion.ExclusionBusy("the GPU is busy with another process; retry after it finishes")
+        except exclusion.ExclusionBusy as exc:
+            raise _exclusion_conflict(exc) from exc
+        with exclusion.gpu_gate(PACKAGE_ROOT):
+            models = _load_model_service(DEFAULT_MODEL_ROOT)
+        models = exclusion.guard_model(models, PACKAGE_ROOT)
+        if getattr(models, "require_gpu", True) is False:
+            raise RuntimeError("the configured model service is not GPU-required")
+        revision = getattr(models, "identity_revision", None) or "unknown"
+        reader_class = VideoReader or _import_video_reader()
+        reader = reader_class(video.path)
+        frames: list[dict[str, Any]] = []
+        crops: list[Any] = []
+        checked = 0
+        for time_value in times:
+            frame = _read_video_sample_from_reader(reader, time_value, max_side=960)
+            if frame is None:
+                continue
+            checked += 1
+            detections = _character_detection_records(models, frame.image)
+            if not detections:
+                continue
+            crops.extend(_crop_normalized(frame.image, detection["box"]) for detection in detections)
+            frames.append({
+                "pts": int(frame.pts),
+                "time": float(frame.time),
+                "detections": detections,
+                "preview_url": f"/api/videos/{video.id}/frame-preview?pts={int(frame.pts)}",
+            })
+        if index is None:
+            index = _suggestion_index(video)
+        index.threshold = model_threshold(models)
+        features, distance = embed_crops(models, crops)
+        _index_frames(index, frames, features, distance)
+        return {
+            "frames": frames,
+            "checked_frames": checked,
+            "detector": "person_head",
+            "model_revision": str(revision),
+            "identity_grouping": bool(index.identity_grouping and features is not None),
+            "grouping": "ccip_official_threshold" if features is not None else "none",
+            "identity_threshold": index.threshold,
+        }
+    finally:
+        _GPU_LOCK.release()
+
+
 def _read_video_frame(path: Path, time_value: float) -> Any:
     """Read one exact/nearest frame while preserving the PTS-aware path."""
 
@@ -1155,6 +1438,72 @@ def _read_video_frame(path: Path, time_value: float) -> Any:
         raise
     except Exception as exc:
         raise RuntimeError(f"unable to decode requested video frame: {exc}") from exc
+
+
+def _frame_preview_jpeg(path: Path, time_value: float) -> bytes:
+    """Return a small browser preview without registering it as a reference."""
+
+    if Image is None:
+        raise RuntimeError("Pillow is required to render frame previews")
+    value = _read_video_frame(path, time_value)
+    return _image_preview_jpeg(value)
+
+
+def _image_preview_jpeg(value: Any) -> bytes:
+    if Image is None:
+        raise RuntimeError("Pillow is required to render frame previews")
+    if not isinstance(value, Image.Image):
+        value = Image.fromarray(value)
+    image = value.convert("RGB")
+    image.thumbnail((480, 270), getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1))
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=78, optimize=True)
+    return output.getvalue()
+
+
+def _read_video_sample_from_reader(reader: Any, time_value: float, *, max_side: int = 960) -> Any:
+    """Read a sampled frame with the source's real presentation timestamp."""
+
+    info = getattr(reader, "info", None)
+    info = info() if callable(info) else info
+    if isinstance(info, Mapping):
+        duration = float(info.get("duration") or 0.0)
+        fps = float(info.get("fps") or 0.0)
+    else:
+        duration = float(getattr(info, "duration", 0.0) or 0.0)
+        fps = float(getattr(info, "fps", 0.0) or 0.0)
+    step = max(0.001, min(0.1, 1.0 / fps if fps > 0 else 0.04))
+    end = time_value + max(0.1, step * 2.0)
+    if duration > 0:
+        end = min(duration, end)
+    sample = getattr(reader, "sample", None)
+    if not callable(sample):
+        raise RuntimeError("video reader does not provide PTS-aware sampling")
+    try:
+        frames = sample(time_value, end, step, max_side=max_side)
+    except TypeError:
+        frames = sample(time_value, end, step)
+    iterator = iter(frames)
+    try:
+        frame = next(iterator, None)
+    finally:
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            close()
+    if frame is None or not all(hasattr(frame, name) for name in ("pts", "time", "image")):
+        return None
+    return frame
+
+
+def _read_video_frame_at_pts(path: Path, pts: int) -> Any:
+    """Decode one exact source PTS; never substitute a time-based frame."""
+
+    reader_class = VideoReader or _import_video_reader()
+    reader = reader_class(path)
+    get_frame = getattr(reader, "get_frame", None)
+    if not callable(get_frame):
+        raise RuntimeError("video reader does not provide exact-PTS reads")
+    return get_frame(int(pts), max_side=None)
 
 
 def _save_pil(value: Any, path: Path) -> tuple[int, int]:
@@ -1321,7 +1670,7 @@ def _process_logo_frame(
         # The analysis worker and every logo operation share this lock.  Model
         # initialization and inference therefore serialize on the same GPU
         # boundary while the caller remains on the bounded worker thread.
-        with _GPU_LOCK:
+        with _GPU_LOCK, exclusion.gpu_gate(PACKAGE_ROOT):
             processor = _get_logo_processor()
             # ``force=False`` is intentional: the core's conservative detector
             # must report unknown/no-hit instead of blindly masking a frame.
@@ -1432,6 +1781,7 @@ def _job_public(job: JobRecord) -> dict[str, Any]:
         "warnings": job.warnings,
         "candidates": public_candidates,
         "stats": job.stats,
+        "run": {key: value for key, value in job.run.items() if not key.startswith("_")},
     }
 
 
@@ -1480,15 +1830,18 @@ def _run_job(job_id: str) -> None:
             return
         job.status = "running"
         job.message = "モデルを準備中…"
+    _update_run_manifest(job, status="running", started_at=runs.utc_now())
     try:
-        with _GPU_LOCK:
+        video = _get_video(job.video_id)
+        with _GPU_LOCK, _video_exclusion(video):
             if job.cancel_event.is_set():
                 raise _CancelledJob()
-            video = _get_video(job.video_id)
             # Model weights are a process-wide GPU resource and remain pinned
             # to the configured local default.  Per-job model_root overrides
             # are intentionally not accepted by the request schema.
-            models = _load_model_service(DEFAULT_MODEL_ROOT)
+            with exclusion.gpu_gate(PACKAGE_ROOT):
+                models = _load_model_service(DEFAULT_MODEL_ROOT)
+            models = exclusion.guard_model(models, PACKAGE_ROOT)
             job.model_revision = getattr(models, "revision", None)
             if callable(job.model_revision):
                 try:
@@ -1498,19 +1851,26 @@ def _run_job(job_id: str) -> None:
             if job.cancel_event.is_set():
                 raise _CancelledJob()
             references: list[Any] = []
-            for item in job.reference_items:
-                reference = REFERENCE_REGISTRY[item["id"]]
-                image = _reference_to_pil(reference)
-                box = item.get("box")
-                if box is None:
-                    box = _detection_box(models, image)
-                item["box"] = box
-                # The crop coordinates are supplied by the canvas in normalized
-                # form.  Crop before handing references to the pipeline so
-                # identity features are computed on exactly the selected
-                # target area; retain the normalized box in the job record for
-                # metadata and diagnostics.
-                references.append(_crop_normalized(image, box))
+            if job.settings.get("selection_mode", "reference") == "reference":
+                for item in job.reference_items:
+                    reference = REFERENCE_REGISTRY[item["id"]]
+                    image = _reference_to_pil(reference)
+                    box = item.get("box")
+                    if box is None:
+                        box = _detection_box(models, image)
+                    item["box"] = box
+                    # The crop coordinates are supplied by the canvas in normalized
+                    # form.  Crop before handing references to the pipeline so
+                    # identity features are computed on exactly the selected
+                    # target area; retain the normalized box in the job record for
+                    # metadata and diagnostics.
+                    references.append(_crop_normalized(image, box))
+                keys = [item.get("character_key") for item in job.reference_items]
+                if any(keys):
+                    # One stable candidate key per reference crop: crops with
+                    # the same key are one character; different keys keep the
+                    # user's multi-character intent through matching.
+                    job.settings["_reference_character_keys"] = [str(key or "manual") for key in keys]
             pipeline = run_search or _import_pipeline()
             if pipeline is None:
                 raise RuntimeError("anime_picker.pipeline.run_search is unavailable")
@@ -1570,20 +1930,36 @@ def _run_job(job_id: str) -> None:
                 job.candidates = normalized_candidates
                 job.warnings = list(result.get("warnings") or [])
                 job.stats = dict(result.get("stats") or {}) if isinstance(result.get("stats") or {}, Mapping) else {}
+            # Persist the completed run before the job becomes visible as done,
+            # so an immediate same-condition rerun sees the complete manifest.
+            _update_run_manifest(
+                job,
+                status=runs.TERMINAL_COMPLETE,
+                completed_at=runs.utc_now(),
+                result_root=os.fspath(job.result_root.resolve()),
+                candidates=normalized_candidates,
+                warnings=job.warnings,
+                stats=job.stats,
+                model_revision=job.model_revision,
+            )
+            with _STATE_LOCK:
                 job.progress = 1.0
                 job.message = "解析完了"
                 job.status = "done"
     except _CancelledJob:
+        _update_run_manifest(job, status="cancelled")
         with _STATE_LOCK:
             job.status = "cancelled"
             job.message = "キャンセル済み"
             job.progress = min(job.progress, 1.0)
     except HTTPException as exc:
+        _update_run_manifest(job, status="error", error=str(exc.detail))
         with _STATE_LOCK:
             job.status = "error"
             job.error = str(exc.detail)
             job.message = "解析に失敗しました"
     except Exception as exc:
+        _update_run_manifest(job, status="error", error=str(exc))
         with _STATE_LOCK:
             job.status = "error"
             job.error = str(exc)
@@ -1594,8 +1970,12 @@ class _CancelledJob(Exception):
     pass
 
 
-def _parse_reference_items(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list) or not value:
+def _parse_reference_items(value: Any, *, required: bool = True) -> list[dict[str, Any]]:
+    if value is None and not required:
+        return []
+    if not isinstance(value, list) or (required and not value):
+        if not required and value == []:
+            return []
         raise HTTPException(status_code=422, detail="at least one reference is required")
     result: list[dict[str, Any]] = []
     for item in value:
@@ -1609,7 +1989,15 @@ def _parse_reference_items(value: Any) -> list[dict[str, Any]]:
         if reference is None:
             raise HTTPException(status_code=422, detail=f"unknown reference: {reference_id}")
         box = _normalize_box(item.get("box"), reference.width, reference.height)
-        result.append({"id": reference_id, "box": box})
+        parsed: dict[str, Any] = {"id": reference_id, "box": box}
+        key = item.get("character_key")
+        if key is not None:
+            if not isinstance(key, str) or not CHARACTER_KEY_RE.fullmatch(key):
+                raise HTTPException(status_code=422, detail="character_key must be a stable candidate key")
+            parsed["character_key"] = key
+        if item.get("source_pts") is not None:
+            parsed["source_pts"] = _coerce_int(item.get("source_pts"), name="source_pts", minimum=0)
+        result.append(parsed)
     return result
 
 
@@ -1625,9 +2013,10 @@ def _parse_settings(value: Any, duration: float) -> dict[str, Any]:
     if settings["end"] and settings["end"] < settings["start"]:
         raise HTTPException(status_code=422, detail="end must be >= start")
     settings["coarse_step"] = _coerce_number(settings["coarse_step"], name="coarse_step", minimum=0.001)
+    settings["auto_sample_step"] = _coerce_number(settings["auto_sample_step"], name="auto_sample_step", minimum=0.001)
     settings["dense_step"] = _coerce_number(settings["dense_step"], name="dense_step", minimum=0.001)
-    settings["candidate_count"] = _coerce_int(settings["candidate_count"], name="candidate_count", minimum=1, maximum=1000)
-    for key in ("identity_threshold", "tag_threshold", "quality_min", "identity_weight", "condition_weight", "quality_weight"):
+    settings["candidate_count"] = _coerce_int(settings["candidate_count"], name="candidate_count", minimum=0)
+    for key in ("identity_threshold", "tag_threshold", "quality_min", "cut_quality_min", "identity_weight", "condition_weight", "quality_weight"):
         settings[key] = _coerce_number(settings[key], name=key, minimum=0.0, maximum=1.0)
     settings["rescue"] = bool(settings["rescue"])
     settings["logo_removal"] = _coerce_bool(settings["logo_removal"], name="logo_removal")
@@ -1741,6 +2130,23 @@ def _source_unchanged(video: VideoRecord) -> bool:
     try:
         return _reader_fingerprint(video.path) == video.fingerprint
     except OSError:
+        return False
+
+
+def _source_stat_unchanged(video: VideoRecord) -> bool:
+    """Cheap stale-source guard for cached PTS/boxes; don't rehash a video per page."""
+
+    try:
+        parts = str(video.fingerprint).split(":")
+        if len(parts) >= 6 and parts[0] == "sha256" and parts[2] == "size" and parts[4] == "mtime_ns":
+            expected_size, expected_mtime = int(parts[3]), int(parts[5])
+        elif len(parts) >= 3 and parts[0].isdecimal() and parts[1].isdecimal():
+            expected_size, expected_mtime = int(parts[0]), int(parts[1])
+        else:
+            return False
+        stat = video.path.stat()
+        return int(stat.st_size) == expected_size and int(stat.st_mtime_ns) == expected_mtime
+    except (OSError, TypeError, ValueError, OverflowError):
         return False
 
 
@@ -1977,6 +2383,22 @@ def _export_job(
     logo_options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     video = _get_video(job.video_id)
+    try:
+        export_root = _resolve_output_root(job.settings.get("output_root") or DEFAULT_OUTPUT_ROOT)
+    except (TypeError, ValueError, OSError) as exc:
+        raise HTTPException(status_code=422, detail="invalid output_root") from exc
+    # Logo removal runs a GPU model, which a lock-less batch would contend for.
+    logo_requested, _profiles = _effective_logo_options(job, logo_options)
+    with _video_exclusion(video, output_root=export_root, gpu=logo_requested):
+        return _export_job_exclusive(job, video, candidate_ids, logo_options)
+
+
+def _export_job_exclusive(
+    job: JobRecord,
+    video: VideoRecord,
+    candidate_ids: list[str],
+    logo_options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     if not _source_unchanged(video):
         raise HTTPException(status_code=409, detail="source video changed after analysis")
     selected = [candidate for candidate in job.candidates if str(candidate.get("id")) in candidate_ids]
@@ -1988,14 +2410,33 @@ def _export_job(
         output_root = _resolve_output_root(output_value)
     except (TypeError, ValueError, OSError) as exc:
         raise HTTPException(status_code=422, detail="invalid output_root") from exc
+    state_root = default_state_root(output_root, PACKAGE_ROOT)
+    layout_state_root = publication_state_root(output_root)
+    display_name = video.display_name or video.path.name
     try:
-        output_root.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"unable to create output directory: {exc}") from exc
+        images_directory = video_output_directory(
+            output_root,
+            display_name,
+            video.fingerprint,
+            state_root=layout_state_root,
+            create_images=False,
+        )
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=f"unable to allocate output directory: {exc}") from exc
+    identity = hashlib.sha256((display_name.casefold() + "\0" + video.fingerprint).encode("utf-8")).hexdigest()[:16]
     timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-    directory = output_root / f"{_safe_filename(video.path.stem)}_{timestamp}_{uuid.uuid4().hex[:8]}"
+    directory = state_root / "exports" / identity / f"{timestamp}_{uuid.uuid4().hex[:8]}"
     directory.mkdir(parents=True, exist_ok=False)
-    files: list[str] = []
+    status_path = directory / "export-status.json"
+    status: dict[str, Any] = {
+        "status": "running",
+        "source_path": os.fspath(video.path),
+        "source_fingerprint": video.fingerprint,
+        "images_directory": os.fspath(images_directory),
+        "created_at": _utc_now(),
+        "published_files": [],
+    }
+    status_path.write_text(json.dumps(status, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     original_files: list[str] = []
     metadata_candidates: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -2039,7 +2480,6 @@ def _export_job(
                 )
             if not destination.is_file():
                 raise RuntimeError(f"candidate {candidate.get('id')} was not exported")
-            files.append(os.fspath(destination))
             metadata_candidates.append(
                 {
                     "id": candidate.get("id"),
@@ -2065,6 +2505,7 @@ def _export_job(
                     "logo_model_hash": logo_cleanup.get("model_hash"),
                     "logo_precision": logo_cleanup.get("precision"),
                     "original_relative_path": original_relative_path,
+                    "_staged_file": destination.name,
                 }
             )
         metadata: dict[str, Any] = {
@@ -2085,11 +2526,64 @@ def _export_job(
             "created_at": _utc_now(),
         }
         metadata_path = directory / "metadata.json"
+        staged_items: list[tuple[dict[str, Any], Path, str]] = []
+        publication_sources: list[dict[str, Any]] = []
+        for item in metadata_candidates:
+            staged = directory / str(item.pop("_staged_file"))
+            digest = _sha256_file(staged)
+            staged_items.append((item, staged, digest))
+            publication_sources.append({"source": staged, "pts": int(item["pts"]), "sha256": digest})
+        run_token = hashlib.sha256(
+            json.dumps(
+                {
+                    "source": video.fingerprint,
+                    "candidates": [str(item.get("id")) for item in metadata_candidates],
+                    "logo_requested": logo_requested,
+                    "logo_profiles": list(logo_profile_ids),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        images_directory, public_entries, public_names, _active = publish_image_set(
+            output_root,
+            display_name,
+            video.fingerprint,
+            publication_sources,
+            state_root=layout_state_root,
+            run_id=run_token,
+            receipt_paths=[status_path, metadata_path],
+        )
+        public_files = [os.fspath(output_root / Path(item["file"])) for item in public_entries]
+        copied_files = [item["file"] for item in public_entries if item.get("copied")]
+        status.update({"status": "publishing", "published_files": public_files, "images_directory": os.fspath(images_directory)})
+        status_path.write_text(json.dumps(status, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        for item, _staged, digest in staged_items:
+            item["public_file"] = public_names[(int(item["pts"]), digest)]
+            item["public_sha256"] = digest
+        metadata["status"] = "completed"
+        metadata["images_directory"] = os.fspath(images_directory)
+        metadata["public_files"] = public_files
+        metadata["copied_files"] = copied_files
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        files.append(os.fspath(metadata_path))
+        status.update({"status": "completed", "metadata_path": os.fspath(metadata_path), "completed_at": _utc_now()})
+        status_path.write_text(json.dumps(status, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        register_public_receipts(
+            output_root,
+            display_name,
+            video.fingerprint,
+            state_root=layout_state_root,
+            receipt_paths=[status_path, metadata_path],
+            publication_id=_active.get("publication_id"),
+        )
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        images_directory = Path(str(metadata["images_directory"]))
+        public_files = list(metadata["public_files"])
         return {
-            "directory": os.fspath(directory),
-            "files": files,
+            "directory": os.fspath(images_directory),
+            "output_folder": os.fspath(images_directory.parent),
+            "files": public_files,
+            "png_count": len(public_files),
             "originals": original_files,
             "original_files": original_files,
             "metadata": metadata,
@@ -2097,16 +2591,275 @@ def _export_job(
             "metadata_path": os.fspath(metadata_path),
         }
     except HTTPException:
-        shutil.rmtree(directory, ignore_errors=True)
+        status.update({"status": "incomplete", "error": "export interrupted or source rejected", "updated_at": _utc_now()})
+        status_path.write_text(json.dumps(status, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         raise
     except Exception as exc:
-        shutil.rmtree(directory, ignore_errors=True)
+        status.update({"status": "incomplete", "error": f"{type(exc).__name__}: {exc}", "updated_at": _utc_now()})
+        status_path.write_text(json.dumps(status, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         raise HTTPException(status_code=500, detail=f"export failed: {exc}") from exc
+
+
+def _reference_digest(item: Mapping[str, Any]) -> str:
+    with _STATE_LOCK:
+        record = REFERENCE_REGISTRY.get(str(item.get("id")))
+    if record is None:
+        return f"missing:{item.get('id')}"
+    try:
+        return _sha256_file(record.path)
+    except OSError:
+        return f"unreadable:{record.id}"
+
+
+def _run_public(job: JobRecord) -> dict[str, Any]:
+    return {key: value for key, value in job.run.items() if not key.startswith("_")}
+
+
+def _run_lock(run_id: str) -> threading.RLock:
+    with _STATE_LOCK:
+        lock = RUN_LOCKS.get(run_id)
+        if lock is None:
+            lock = RUN_LOCKS[run_id] = threading.RLock()
+        return lock
+
+
+def _update_run_manifest(job: JobRecord, **fields: Any) -> None:
+    """Persist run status; a manifest write failure never fails the job.
+
+    Only the job that currently owns the run writes, so a superseded job
+    (for example one still winding down after a cancel) cannot overwrite the
+    status of the job that replaced it.
+    """
+
+    manifest = job.run.get("_manifest")
+    if not isinstance(manifest, dict):
+        return
+    run_id = str(manifest.get("run_id"))
+    with _run_lock(run_id):
+        with _STATE_LOCK:
+            if RUN_OWNERS.get(run_id) != job.id:
+                return
+        manifest.update(fields)
+        try:
+            runs.write_manifest(RUN_ROOT, json.loads(json.dumps(manifest, default=str)))
+        except (OSError, TypeError, ValueError) as exc:
+            job.warnings.append(f"run manifest could not be written: {exc}")
+
+
+def _copy_run_references(run_dir: Path, rows: list[dict[str, Any]], references: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep private copies of reference crops so a rerun survives restarts."""
+
+    files: list[dict[str, Any]] = []
+    target_dir = run_dir / "references"
+    for row, item in zip(rows, references):
+        with _STATE_LOCK:
+            record = REFERENCE_REGISTRY.get(str(item.get("id")))
+        entry = {key: row.get(key) for key in ("character_key", "sha256", "box", "source_pts")}
+        if record is not None and record.path.is_file() and re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256"))):
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / f"{row['sha256']}{record.path.suffix.lower() or '.png'}"
+            if not target.is_file():
+                shutil.copyfile(record.path, target)
+            entry["file"] = target.name
+            entry["name"] = record.name
+        files.append(entry)
+    return files
+
+
+def _queue_or_reuse_run(
+    video: VideoRecord,
+    selection_mode: str,
+    references: list[dict[str, Any]],
+    wanted: list[dict[str, str]],
+    avoided: list[dict[str, str]],
+    settings: dict[str, Any],
+    *,
+    force: bool = False,
+    rerun_of: str | None = None,
+) -> dict[str, Any]:
+    rows = [
+        {
+            "character_key": item.get("character_key"),
+            "sha256": _reference_digest(item),
+            "box": item.get("box"),
+            "source_pts": item.get("source_pts"),
+        }
+        for item in (references if selection_mode == "reference" else [])
+    ]
+    selection = runs.selection_record(selection_mode, rows)
+    analysis = runs.analysis_record(settings, wanted, avoided)
+    digest = runs.config_hash(video.fingerprint, selection, analysis)
+    run_id = runs.run_id_for(video.fingerprint, digest)
+    run_info: dict[str, Any] = {"run_id": run_id, "config_hash": digest, "reused": False, "resumed_from": None, "rerun_of": rerun_of, "attached": False}
+    with _run_lock(run_id):
+        return _queue_or_reuse_run_locked(video, selection_mode, references, wanted, avoided, settings, rows, selection, analysis, digest, run_info, force=force)
+
+
+def _live_run_job(run_id: str) -> JobRecord | None:
+    """The queued/running job of a run that has not been asked to cancel."""
+
+    with _STATE_LOCK:
+        return next(
+            (
+                job
+                for job in JOB_REGISTRY.values()
+                if job.run.get("run_id") == run_id and job.status in {"queued", "running"} and not job.cancel_event.is_set()
+            ),
+            None,
+        )
+
+
+def _queue_or_reuse_run_locked(
+    video: VideoRecord,
+    selection_mode: str,
+    references: list[dict[str, Any]],
+    wanted: list[dict[str, str]],
+    avoided: list[dict[str, str]],
+    settings: dict[str, Any],
+    rows: list[dict[str, Any]],
+    selection: dict[str, Any],
+    analysis: dict[str, Any],
+    digest: str,
+    run_info: dict[str, Any],
+    *,
+    force: bool,
+) -> dict[str, Any]:
+    """Caller holds the run lock for run_info["run_id"]."""
+
+    run_id = str(run_info["run_id"])
+    live = _live_run_job(run_id)
+    if live is not None:
+        # The same selection and settings are already being analyzed. force
+        # only bypasses reuse of a *finished* result; a live job for the same
+        # run id is already a fresh computation, so force attaches to it too
+        # instead of starting a duplicate (cancel it first to restart).
+        return {"job_id": live.id, "run": {**_run_public(live), "attached": True, "force_attached": bool(force)}}
+    previous = runs.read_manifest(RUN_ROOT, run_id)
+    job = JobRecord(uuid.uuid4().hex, video.id, references, wanted, avoided, settings)
+    export_settings = {key: settings.get(key) for key in runs.EXPORT_SETTING_KEYS if key in settings}
+    if not force and runs.verified_complete(previous, digest, RESULT_ROOT):
+        assert previous is not None
+        job.candidates = [dict(item) for item in previous["candidates"]]
+        job.result_root = Path(previous["result_root"])
+        job.warnings = list(previous.get("warnings") or [])
+        job.stats = dict(previous.get("stats") or {})
+        job.status, job.progress, job.message = "done", 1.0, "同じ選択・条件の完了結果を再利用しました"
+        job.run = {**run_info, "reused": True, "reused_from_job": previous.get("job_id")}
+        with _STATE_LOCK:
+            JOB_REGISTRY[job.id] = job
+        return {"job_id": job.id, "run": _run_public(job)}
+    if previous is not None:
+        # Interrupted/cancelled/failed or unverifiable results are re-executed
+        # with the same inherited selection and settings, never trusted.
+        run_info["resumed_from"] = previous.get("status") or "unknown"
+    _refuse_conflicting_start(video)
+    # Register the queued job and take ownership of the run first, so any
+    # later submission (and any superseded job) sees it before manifest I/O.
+    job.run = {**run_info}
+    with _STATE_LOCK:
+        JOB_REGISTRY[job.id] = job
+        RUN_OWNERS[run_id] = job.id
+    try:
+        run_dir = RUN_ROOT / run_id
+        manifest = {
+            "revision": runs.RUN_MANIFEST_REVISION,
+            "run_id": run_id,
+            "config_hash": digest,
+            "fingerprint": video.fingerprint,
+            "video_path": os.fspath(video.path),
+            "video_name": video.display_name or video.path.name,
+            "selection": selection,
+            "analysis": analysis,
+            "export_settings": export_settings,
+            "status": "queued",
+            "attempts": int((previous or {}).get("attempts", 0) or 0) + 1,
+            "created_at": (previous or {}).get("created_at") or runs.utc_now(),
+            "job_id": job.id,
+            "result_root": os.fspath((RESULT_ROOT / job.id).resolve(strict=False)),
+            "candidates": [],
+            "reference_files": _copy_run_references(run_dir, rows, references),
+            "resumed_from": run_info["resumed_from"],
+            "rerun_of": run_info.get("rerun_of"),
+        }
+        job.run = {**run_info, "_manifest": manifest}
+        _update_run_manifest(job)
+        job.future = _executor().submit(_run_job, job.id)
+    except Exception as exc:
+        with _STATE_LOCK:
+            job.status, job.error, job.message = "error", f"{type(exc).__name__}: {exc}", "解析を開始できませんでした"
+            if RUN_OWNERS.get(run_id) == job.id:
+                RUN_OWNERS.pop(run_id, None)
+        raise
+    return {"job_id": job.id, "run": _run_public(job)}
+
+
+def _submit_job(payload: Mapping[str, Any], *, force: bool = False, rerun_of: str | None = None) -> dict[str, Any]:
+    """Validate a job request, then reuse, attach to, or queue its run."""
+
+    video_id = payload.get("video_id")
+    if not isinstance(video_id, str):
+        raise HTTPException(status_code=422, detail="video_id is required")
+    video = _get_video(video_id)
+    raw_settings = payload.get("settings")
+    selection_mode = payload.get("selection_mode")
+    if selection_mode is None and isinstance(raw_settings, Mapping):
+        selection_mode = raw_settings.get("selection_mode")
+    selection_mode = str(selection_mode or "reference").strip().lower()
+    if selection_mode not in {"automatic", "reference"}:
+        raise HTTPException(status_code=422, detail="selection_mode must be automatic or reference")
+    references = _parse_reference_items(payload.get("references", []), required=selection_mode == "reference")
+    wanted = _normalize_tags(payload.get("wanted", []), field="wanted")
+    avoided = _normalize_tags(payload.get("avoided", []), field="avoided")
+    if selection_mode == "automatic":
+        subject_conditions = [item["tag"] for item in [*wanted, *avoided] if item.get("scope") == "subject"]
+        if subject_conditions:
+            names = ", ".join(subject_conditions[:5])
+            raise HTTPException(
+                status_code=422,
+                detail=f"automatic mode supports frame-scoped tag conditions only; change or remove subject-scoped tags ({names}) or switch to reference mode",
+            )
+    settings = _parse_settings(payload.get("settings"), float(video.info.get("duration") or 0.0))
+    if isinstance(raw_settings, Mapping):
+        if "auto_sample_step" in raw_settings:
+            settings["auto_sample_step"] = _coerce_number(raw_settings["auto_sample_step"], name="auto_sample_step", minimum=0.001)
+        elif "coarse_step" in raw_settings:
+            # Older UI/API clients used coarse_step for every mode. Preserve
+            # that explicit interval while new automatic clients send the
+            # dedicated auto_sample_step setting.
+            settings["auto_sample_step"] = _coerce_number(raw_settings["coarse_step"], name="coarse_step", minimum=0.001)
+    settings["selection_mode"] = selection_mode
+    if selection_mode == "reference" and any(item.get("character_key") for item in references):
+        # Keyed selection: references without a candidate key (uploaded or
+        # manually captured) form one explicit "manual" character.
+        for item in references:
+            item.setdefault("character_key", "manual")
+    return _queue_or_reuse_run(video, selection_mode, references, wanted, avoided, settings, force=force, rerun_of=rerun_of)
 
 
 def create_app() -> FastAPI:
     _ensure_dirs()
     api = FastAPI(title="Anime Frame Picker", docs_url=None, redoc_url=None)
+    accepted_catalogue = AcceptedCatalogue(DEFAULT_OUTPUT_ROOT)
+    api.state.accepted_catalogue = accepted_catalogue
+
+    @api.exception_handler(CatalogueError)
+    async def catalogue_error(request: Request, exc: CatalogueError) -> Any:
+        return JSONResponse({"detail": str(exc)}, status_code=exc.status)
+
+    @api.get("/api/accepted-catalogue")
+    def accepted_summary() -> dict[str, Any]:
+        return accepted_catalogue.summary()
+
+    @api.get("/api/accepted-catalogue/frames")
+    def accepted_frames(q: str = "", row: str = "", tag_category: str = "",
+                        min_score: float = 0.1, cursor: str = "", limit: int = 40) -> dict[str, Any]:
+        return accepted_catalogue.frames(q=q, row=row, tag_category=tag_category,
+                                         min_score=min_score, cursor=cursor, limit=limit)
+
+    @api.get("/api/accepted-catalogue/frames/{stable_id}/image")
+    def accepted_image(stable_id: str) -> Any:
+        return Response(accepted_catalogue.image(stable_id), media_type="image/png",
+                        headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "private, no-cache"})
 
     @api.middleware("http")
     async def local_only(request: Request, call_next: Callable[..., Any]) -> Any:
@@ -2164,7 +2917,7 @@ def create_app() -> FastAPI:
         path = UPLOAD_ROOT / f"{uuid.uuid4().hex}{suffix}"
         await _read_upload(file, path, MAX_UPLOAD_BYTES)
         try:
-            record = _register_video(path)
+            record = _register_video(path, display_name=name)
         except HTTPException:
             path.unlink(missing_ok=True)
             raise
@@ -2203,24 +2956,138 @@ def create_app() -> FastAPI:
     @api.post("/api/videos/{video_id}/reference")
     async def capture_reference(video_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         video = _get_video(video_id)
-        time_value = _coerce_number(payload.get("time", 0.0), name="time", minimum=0.0)
-        if video.info.get("duration") and time_value > float(video.info["duration"]):
-            raise HTTPException(status_code=422, detail="time is outside video duration")
+        source_pts: int | None = None
+        if payload.get("pts") is not None:
+            if not _source_stat_unchanged(video):
+                raise HTTPException(status_code=409, detail="source changed after inspection; reselect the video before using saved PTS evidence")
+            source_pts = _coerce_int(payload.get("pts"), name="pts")
+            try:
+                sampled = _read_video_frame_at_pts(video.path, source_pts)
+                image = sampled.image
+                time_value = float(sampled.time)
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail=f"unable to read exact source PTS: {exc}") from exc
+        else:
+            time_value = _coerce_number(payload.get("time", 0.0), name="time", minimum=0.0)
+            if video.info.get("duration") and time_value > float(video.info["duration"]):
+                raise HTTPException(status_code=422, detail="time is outside video duration")
+            try:
+                image = _read_video_frame(video.path, time_value)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail=f"unable to read video frame: {exc}") from exc
+        width, height = getattr(image, "size", (0, 0))
+        raw_box = payload.get("box")
+        box = _normalize_box(raw_box, int(width), int(height)) if width and height else None
+        if raw_box is not None and box is None:
+            raise HTTPException(status_code=422, detail="box must be a valid normalized xyxy rectangle")
         try:
-            image = _read_video_frame(video.path, time_value)
             reference_id = uuid.uuid4().hex
             path = REFERENCE_ROOT / f"{reference_id}.png"
             width, height = _save_pil(image, path)
-        except HTTPException:
-            raise
         except Exception as exc:
             raise HTTPException(status_code=422, detail=f"unable to read video frame: {exc}") from exc
-        record = ReferenceRecord(reference_id, path.resolve(), f"{video.path.stem}_{time_value:.3f}s.png", width, height, _utc_now())
+        name = f"{video.path.stem}_pts_{source_pts}.png" if source_pts is not None else f"{video.path.stem}_{time_value:.3f}s.png"
+        record = ReferenceRecord(reference_id, path.resolve(), name, width, height, _utc_now())
         with _STATE_LOCK:
             REFERENCE_REGISTRY[record.id] = record
         result = _reference_response(record)
         result["time"] = time_value
+        if source_pts is not None:
+            result["source_pts"] = source_pts
+        result["box"] = box
         return result
+
+    @api.post("/api/videos/{video_id}/character-suggestions")
+    def character_suggestions(video_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        video = _get_video(video_id)
+        if not _source_stat_unchanged(video):
+            raise HTTPException(status_code=409, detail="source changed after inspection; reselect the video before requesting candidate frames")
+        raw_times = payload.get("times")
+        if not isinstance(raw_times, list) or not raw_times:
+            raise HTTPException(status_code=422, detail="times must contain sampled video times")
+        if len(raw_times) > MAX_SUGGESTION_PAGE_FRAMES:
+            raise HTTPException(status_code=422, detail=f"at most {MAX_SUGGESTION_PAGE_FRAMES} times may be checked per page")
+        times = [_coerce_number(value, name="time", minimum=0.0) for value in raw_times]
+        duration = float(video.info.get("duration") or 0.0)
+        if duration > 0 and any(value > duration for value in times):
+            raise HTTPException(status_code=422, detail="a sampled time is outside video duration")
+        page = _coerce_int(payload.get("page", 0), name="page", minimum=0)
+        # Page 0 starts a fresh candidate screen for this source; later pages
+        # ("show more candidates") add crops to the same stable groups.
+        index = _suggestion_index(video, reset=page == 0)
+        preview_url = _member_preview_url(video)
+        cached_frames = _archived_character_frames(video)
+        cache_start = page * MAX_SUGGESTION_PAGE_FRAMES
+        if cache_start < len(cached_frames):
+            cached_page = cached_frames[cache_start:cache_start + MAX_SUGGESTION_PAGE_FRAMES]
+            # Archived crops carry no reusable CCIP vectors here, so they are
+            # offered one crop per candidate rather than guessed into groups.
+            _index_frames(index, cached_page, None, None)
+            return {
+                "characters": index.public(preview_url),
+                "frames": cached_page,
+                "checked_frames": 0,
+                "detector": "archived_detector_ccip",
+                "cache_total": len(cached_frames),
+                "cache_page": page,
+                "has_more_cache": cache_start + len(cached_page) < len(cached_frames),
+                "identity_grouping": False,
+            }
+        try:
+            result = _suggest_character_frames(video, times, index)
+            result["characters"] = index.public(preview_url)
+            result["cache_total"] = len(cached_frames)
+            result["cache_exhausted"] = bool(cached_frames)
+            return result
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"GPU person/head detection is unavailable; CPU fallback was not used: {exc}",
+            ) from exc
+
+    @api.get("/api/videos/{video_id}/frame-preview")
+    def frame_preview(video_id: str, time: float = 0.0, pts: int | None = None, box: str | None = None) -> Response:
+        """Serve a downscaled frame preview from its exact PTS or requested time.
+
+        ``box`` (normalized ``x1,y1,x2,y2``) returns a candidate crop of that
+        exact-PTS frame for the character selection screen.
+        """
+
+        video = _get_video(video_id)
+        crop_box: list[float] | None = None
+        if box is not None:
+            try:
+                values = [float(value) for value in str(box).split(",")]
+            except ValueError:
+                values = []
+            if len(values) != 4 or not all(math.isfinite(v) for v in values) or not (0 <= values[0] < values[2] <= 1 and 0 <= values[1] < values[3] <= 1):
+                raise HTTPException(status_code=422, detail="box must be normalized x1,y1,x2,y2")
+            if pts is None:
+                raise HTTPException(status_code=422, detail="box previews require an exact pts")
+            crop_box = values
+        try:
+            if pts is not None:
+                if not _source_stat_unchanged(video):
+                    raise HTTPException(status_code=409, detail="source changed after inspection; reselect the video before previewing this PTS")
+                frame = _read_video_frame_at_pts(video.path, int(pts))
+                image = frame.image
+                if crop_box is not None:
+                    image = _crop_normalized(image, _expand_box(crop_box, 0.04))
+                content = _image_preview_jpeg(image)
+            else:
+                time_value = _coerce_number(time, name="time", minimum=0.0)
+                if video.info.get("duration") and time_value > float(video.info["duration"]):
+                    raise HTTPException(status_code=422, detail="time is outside video duration")
+                content = _frame_preview_jpeg(video.path, time_value)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"unable to render frame preview: {exc}") from exc
+        return Response(content, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
     @api.get("/api/vocabulary")
     async def vocabulary(q: str = "") -> dict[str, Any]:
@@ -2252,19 +3119,63 @@ def create_app() -> FastAPI:
 
     @api.post("/api/jobs")
     async def create_job(payload: dict[str, Any]) -> dict[str, Any]:
-        video_id = payload.get("video_id")
-        if not isinstance(video_id, str):
-            raise HTTPException(status_code=422, detail="video_id is required")
+        return _submit_job(payload)
+
+    @api.get("/api/videos/{video_id}/runs")
+    def video_runs(video_id: str) -> dict[str, Any]:
         video = _get_video(video_id)
-        references = _parse_reference_items(payload.get("references"))
-        wanted = _normalize_tags(payload.get("wanted", []), field="wanted")
-        avoided = _normalize_tags(payload.get("avoided", []), field="avoided")
-        settings = _parse_settings(payload.get("settings"), float(video.info.get("duration") or 0.0))
-        job = JobRecord(uuid.uuid4().hex, video_id, references, wanted, avoided, settings)
-        with _STATE_LOCK:
-            JOB_REGISTRY[job.id] = job
-        job.future = _executor().submit(_run_job, job.id)
-        return {"job_id": job.id}
+        return {"runs": [runs.public_summary(item) for item in runs.list_manifests(RUN_ROOT, video.fingerprint)]}
+
+    @api.post("/api/runs/{run_id}/rerun")
+    def rerun(run_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Resume or rerun a saved run with its inherited selection/settings."""
+
+        if not re.fullmatch(r"[0-9a-f]{12}_[0-9a-f]{16}", run_id or ""):
+            raise HTTPException(status_code=404, detail="run not found")
+        manifest = runs.read_manifest(RUN_ROOT, run_id)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        body = payload or {}
+        if not isinstance(body, Mapping):
+            raise HTTPException(status_code=422, detail="rerun payload must be an object")
+        overrides = body.get("settings") or {}
+        if not isinstance(overrides, Mapping):
+            raise HTTPException(status_code=422, detail="settings overrides must be an object")
+        video = _register_video(_check_video_path(str(manifest.get("video_path") or "")))
+        if video.fingerprint != manifest.get("fingerprint"):
+            raise HTTPException(status_code=409, detail="source changed since this run; select the video again and choose characters again")
+        reference_items: list[dict[str, Any]] = []
+        for entry in manifest.get("reference_files") or []:
+            file_name = entry.get("file") if isinstance(entry, Mapping) else None
+            source = RUN_ROOT / run_id / "references" / str(file_name or "")
+            if not file_name or not re.fullmatch(r"[0-9a-f]{64}\.[a-z]{3,4}", str(file_name)) or not source.is_file():
+                raise HTTPException(status_code=409, detail="saved reference crops are missing; choose characters again")
+            reference_id = uuid.uuid4().hex
+            target = REFERENCE_ROOT / f"{reference_id}{source.suffix}"
+            REFERENCE_ROOT.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            with Image.open(target) as opened:
+                width, height = opened.size
+            record = ReferenceRecord(reference_id, target.resolve(), str(entry.get("name") or source.name), width, height, _utc_now())
+            with _STATE_LOCK:
+                REFERENCE_REGISTRY[record.id] = record
+            item = {"id": record.id, "box": entry.get("box")}
+            if entry.get("character_key"):
+                item["character_key"] = entry["character_key"]
+            if entry.get("source_pts") is not None:
+                item["source_pts"] = entry["source_pts"]
+            reference_items.append(item)
+        analysis = manifest.get("analysis") or {}
+        settings = {**(analysis.get("settings") or {}), **(manifest.get("export_settings") or {}), **dict(overrides)}
+        request = {
+            "video_id": video.id,
+            "selection_mode": settings.get("selection_mode", "reference"),
+            "references": reference_items,
+            "wanted": analysis.get("wanted") or [],
+            "avoided": analysis.get("avoided") or [],
+            "settings": {key: value for key, value in settings.items() if value is not None},
+        }
+        return _submit_job(request, force=bool(body.get("force", False)), rerun_of=run_id)
 
     @api.get("/api/jobs/{job_id}")
     async def get_job(job_id: str) -> dict[str, Any]:

@@ -137,9 +137,9 @@ change.
   Evidence is in `.cache/qa/ui-final-job.json`, `ui-final-export-check.json`,
   `offline-runtime.json`, and `ui-final-preview.png`.
 - The two historical browser-export directories above were not migrated. New
-  exports use the repository-root `outputs/` directory; the current full-run
-  result directories are `outputs/Anime_Frame_Picker_full_Episode1_20261016`
-  and `outputs/Anime_Frame_Picker_full_Episode2_20261016`.
+  exports use the repository-root `outputs/` directory; the 2026-10-16 full-run
+  results are retained under `outputs/_archive/20261020/` and are not mixed
+  with the current per-video `outputs/<video>/images/` layout.
 - The CUDA bfloat16 tagger check used the same crop as a float32 baseline.
   `smile` changed from 0.86146 to 0.86328. Its first call took 13.10 seconds,
   the warm call 0.178 seconds; PyTorch peak allocated/reserved memory was

@@ -47,6 +47,14 @@ def test_identity_uses_official_threshold_and_minimum_reference_distance():
     assert not identity_match(0.201, 0.20)
 
 
+def test_unlimited_candidate_output_keeps_every_candidate():
+    candidates = [{"id": f"candidate-{index}"} for index in range(1501)]
+    assert len(pipeline._candidate_output_pool(candidates, 0)) == len(candidates)
+    assert [item["id"] for item in pipeline._candidate_output_pool(candidates, 4)] == [
+        "candidate-0", "candidate-1", "candidate-2", "candidate-3"
+    ]
+
+
 def test_combined_score_normalizes_weights_and_stays_display_bounded():
     assert combine_score(1.0, 0.0, 0.0, {"identity": 2, "condition": 0, "quality": 0}) == 1.0
     value = combine_score(0.8, 0.6, 0.4, {"identity": 1, "condition": 1, "quality": 2})

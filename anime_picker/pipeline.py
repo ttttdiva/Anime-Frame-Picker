@@ -521,6 +521,12 @@ def _clean_filename(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)[:150]
 
 
+def _candidate_output_pool(candidates: Sequence[Mapping[str, Any]], limit: int) -> list[Mapping[str, Any]]:
+    """Apply an optional result-count limit; zero keeps every candidate."""
+
+    return list(candidates[:limit]) if limit > 0 else list(candidates)
+
+
 def _save_image(image: Any, path: Path) -> bool:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -547,14 +553,19 @@ def _match_rank(candidate: Mapping[str, Any]) -> tuple[float, float, float, floa
 
 
 def _collapse_matches_per_pts(matches: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Keep one strongest surviving match for each exact presentation timestamp."""
+    """Keep one strongest surviving match for each exact presentation timestamp.
 
-    grouped: dict[int, dict[str, Any]] = {}
-    order: list[int] = []
+    When the user selected several characters, the timestamp policy applies
+    per selected character key: one frame may legitimately be a result for
+    two different selected characters.
+    """
+
+    grouped: dict[Any, dict[str, Any]] = {}
+    order: list[Any] = []
 
     for index, raw in enumerate(matches):
         candidate = dict(raw)
-        pts = _as_int(candidate.get("pts"), index)
+        pts = (_as_int(candidate.get("pts"), index), candidate.get("character_key"))
         candidate["_merged_detections"] = max(1, _as_int(candidate.get("_merged_detections"), 1))
         existing = grouped.get(pts)
         if existing is None:
@@ -606,6 +617,53 @@ def _collapse_nested_head_person(matches: Sequence[Mapping[str, Any]]) -> list[d
         best["_merged_detections"] = merged_count
         result.append(best)
     return result
+
+
+def _reference_character_groups(settings: Mapping[str, Any], reference_count: int) -> list[tuple[str | None, list[int]]]:
+    """Group reference rows by the user's stable character selection key.
+
+    ``_reference_character_keys`` is injected by the server, one key per
+    reference crop.  Several crops with one key are references of the same
+    character; different keys are separate selected characters.  Without keys
+    every reference forms one group (the historical any-reference contract).
+    """
+
+    raw = settings.get("_reference_character_keys") if isinstance(settings, Mapping) else None
+    if not isinstance(raw, (list, tuple)) or len(raw) != reference_count or not all(isinstance(item, str) and item for item in raw):
+        return [(None, list(range(reference_count)))]
+    groups: dict[str, list[int]] = {}
+    for index, key in enumerate(raw):
+        groups.setdefault(key, []).append(index)
+    return [(key, indices) for key, indices in groups.items()]
+
+
+def _match_reference_groups(
+    column: Any,
+    groups: Sequence[tuple[str | None, Sequence[int]]],
+    threshold: float,
+) -> tuple[dict[str, Any], str | None]:
+    """Return the closest accepted character group for one crop column.
+
+    Corroboration is computed only among references of the same selected
+    character, so selecting two characters never lets one character's
+    references corroborate a crop of the other.
+    """
+
+    values = np.asarray(column, dtype=np.float64).reshape(-1)
+    best: dict[str, Any] | None = None
+    best_key: str | None = None
+    fallback: dict[str, Any] | None = None
+    for key, indices in groups:
+        match = aggregate_reference_distances(values[list(indices)], threshold)
+        if fallback is None or float(match["distance"]) < float(fallback["distance"]):
+            fallback = match
+        if not match["accepted"]:
+            continue
+        if best is None or float(match["distance"]) < float(best["distance"]):
+            best, best_key = match, key
+    if best is None:
+        return (fallback or aggregate_reference_distances([], threshold)), None
+    return best, best_key
 
 
 def _pixel_diverse_tag_pool(
@@ -745,6 +803,295 @@ def _distance_matrix(service: Any, references: np.ndarray, features: np.ndarray)
     return distances.astype(np.float32)
 
 
+def _run_automatic_character_search(
+    video_path: str,
+    wanted: list[dict[str, Any]],
+    avoided: list[dict[str, Any]],
+    settings: Mapping[str, Any],
+    models: Any,
+    cache_dir: Path,
+    progress: Progress,
+    cancelled: Cancelled,
+) -> dict[str, Any]:
+    """Find and curate sparse character-present samples without identity matching.
+
+    This path intentionally uses only local PixAI tags for character presence.
+    The anime detector is costly on this workstation and is not called for each
+    sampled frame; the curation stage can also operate from tags and pixels.
+    """
+
+    warnings: list[str] = []
+    stats: dict[str, Any] = {
+        "selection_mode": "automatic_character",
+        "sampled_frames": 0,
+        "tagged_frames": 0,
+        "character_candidates": 0,
+        "tag_filtered": 0,
+        "detector_calls": 0,
+        "identity_model_used": False,
+        "identity_clustering_used": False,
+        "character_presence_method": "pixai_general_tags_only",
+        "gpu_required": True,
+    }
+    subject_conditions = [
+        str(item.get("tag", ""))
+        for item in [*wanted, *avoided]
+        if isinstance(item, Mapping) and str(item.get("scope", "frame")).strip().lower() == "subject"
+    ]
+    if subject_conditions:
+        raise PipelineError(
+            "automatic character mode supports frame-scoped tag conditions only; "
+            f"subject-scoped tags must be removed or reference mode selected: {', '.join(subject_conditions[:5])}"
+        )
+
+    def stop() -> bool:
+        if _is_cancelled(cancelled):
+            stats["cancelled"] = True
+            if "cancelled" not in warnings:
+                warnings.append("cancelled")
+            return True
+        return False
+
+    tagger = getattr(models, "tag_many", None)
+    if not callable(tagger):
+        raise PipelineError("automatic character mode requires ModelService.tag_many")
+    if getattr(models, "require_gpu", True) is False:
+        raise PipelineError("automatic character mode requires GPU inference; CPU fallback is disabled")
+    if VideoReader is None:
+        raise PipelineError("VideoReader is unavailable")
+    if stop():
+        return {"candidates": [], "warnings": warnings, "stats": stats}
+
+    try:
+        reader = VideoReader(video_path)
+    except Exception as error:
+        raise PipelineError(f"could not open video: {error}") from error
+    info = getattr(reader, "info", None)
+    duration = _as_number(_video_info_value(info, "duration", "duration_seconds", "length", "duration_sec", default=0.0), 0.0)
+    start = max(0.0, _as_number(_first(settings, "start", "start_time", "startTime", default=0.0), 0.0))
+    configured_end = _as_number(_first(settings, "end", "end_time", "endTime", default=0.0), 0.0)
+    end = configured_end if configured_end > start else duration
+    if duration > 0:
+        end = min(end, duration)
+    if end <= start:
+        raise PipelineError("empty automatic character search interval")
+    step = max(0.001, _as_number(_first(settings, "auto_sample_step", "coarse_step", default=1.0), 1.0))
+    max_side = max(320, min(960, _as_int(_first(settings, "auto_sample_max_side", default=640), 640)))
+    stats.update({"duration": duration, "start": start, "end": end, "sample_step": step, "sample_max_side": max_side})
+
+    frames: list[dict[str, Any]] = []
+    try:
+        sampled = reader.sample(start, end, step, max_side=max_side)
+        for frame in sampled:
+            if stop():
+                return {"candidates": [], "warnings": warnings, "stats": stats}
+            image = _frame_image(frame)
+            if image is None:
+                continue
+            pts = _frame_value(frame, "pts")
+            if pts is None:
+                raise PipelineError("automatic samples must preserve exact presentation PTS")
+            sample_time = _frame_time_value(frame)
+            if sample_time is None:
+                raise PipelineError("automatic samples must preserve presentation time metadata")
+            try:
+                pts_value = int(pts)
+            except (TypeError, ValueError) as error:
+                raise PipelineError("automatic samples returned an invalid presentation PTS") from error
+            frames.append(
+                {
+                    "id": f"auto-pts-{pts_value}",
+                    "pts": pts_value,
+                    "time": float(sample_time),
+                    "stream_index": _as_int(_frame_value(frame, "stream_index", 0), 0),
+                    "image": _ensure_rgb(image),
+                }
+            )
+            stats["sampled_frames"] += 1
+            if stats["sampled_frames"] % 16 == 0:
+                _call_progress(progress, min(0.48, 0.05 + 0.43 * (frames[-1]["time"] - start) / max(0.1, end - start)), "縮小フレームを間引き確認中…")
+    except PipelineError:
+        raise
+    except Exception as error:
+        raise PipelineError(f"automatic sparse video sampling failed: {error}") from error
+
+    if stop():
+        return {"candidates": [], "warnings": warnings, "stats": stats}
+    if not frames:
+        stats["model_revision"] = str(getattr(models, "tag_revision", getattr(models, "revision", "unknown")))
+        _call_progress(progress, 1.0, "候補フレームなし")
+        return {"candidates": [], "warnings": warnings, "stats": stats}
+
+    batch_size = max(1, min(32, _as_int(_first(settings, "tag_batch_size", default=8), 8)))
+    tags_by_frame: list[Mapping[str, Any]] = []
+    for batch_start in range(0, len(frames), batch_size):
+        if stop():
+            return {"candidates": [], "warnings": warnings, "stats": stats}
+        batch = frames[batch_start : batch_start + batch_size]
+        try:
+            rows = tagger([item["image"] for item in batch], batch_size=batch_size)
+        except Exception as error:
+            raise PipelineError(f"PixAI batch tagging failed; GPU inference was not downgraded: {error}") from error
+        if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)) or len(rows) != len(batch):
+            raise PipelineError(f"PixAI tag_many returned {len(rows) if isinstance(rows, Sequence) else 'invalid'} rows for {len(batch)} images")
+        for row in rows:
+            tags_by_frame.append(row if isinstance(row, Mapping) else {})
+        stats["tagged_frames"] = len(tags_by_frame)
+        _call_progress(progress, 0.48 + 0.39 * len(tags_by_frame) / len(frames), "キャラクター・表情タグを解析中…")
+
+    from .curation import curate_candidates
+
+    tag_threshold = clamp01(_as_number(_first(settings, "tag_threshold", default=0.17), 0.17))
+    presence_threshold = max(0.17, clamp01(_as_number(_first(settings, "presence_threshold", default=0.17), 0.17)))
+    minimum_cut_quality = clamp01(_as_number(_first(settings, "cut_quality_min", default=0.55), 0.55))
+    stats["presence_threshold"] = presence_threshold
+    stats["cut_quality_min"] = minimum_cut_quality
+    accepted_records: list[dict[str, Any]] = []
+    tag_filtered = 0
+    for frame_record, tags in zip(frames, tags_by_frame):
+        if stop():
+            return {"candidates": [], "warnings": warnings, "stats": stats}
+        normalized_tags = tags if any(isinstance(value, Mapping) for value in tags.values()) else {"general": tags}
+        condition = evaluate_tags(normalized_tags, normalized_tags, wanted, avoided, tag_threshold)
+        if not condition["passed"]:
+            tag_filtered += 1
+            continue
+        frame_quality = quality_metrics(frame_record["image"])
+        technical_quality = _as_number(frame_quality.get("quality"), 0.5)
+        accepted_records.append(
+            {
+                **frame_record,
+                "tags": normalized_tags,
+                "detections": [],
+                "quality": technical_quality,
+                "technical_quality": technical_quality,
+                # This is an independent neutral prior. Expression quality is
+                # scored once by curation from the raw PixAI tag evidence.
+                "source_score": 0.5,
+                "quality_metrics": frame_quality,
+                "tag_condition": condition,
+            }
+        )
+    stats["tag_filtered"] = tag_filtered
+
+    try:
+        report = curate_candidates(
+            accepted_records,
+            presence_threshold=presence_threshold,
+            time_window=max(0.0, _as_number(_first(settings, "duplicate_time_window", default=4.0), 4.0)),
+            minimum_cut_quality=minimum_cut_quality,
+        )
+    except Exception as error:
+        raise PipelineError(f"automatic character curation failed: {error}") from error
+    stats["character_candidates"] = int(report.get("summary", {}).get("character_present", 0))
+    stats["curation_summary"] = dict(report.get("summary") or {})
+    stats["curation_settings"] = dict(report.get("settings") or {})
+    stats["excluded_no_character"] = sum(1 for item in report.get("excluded", []) if item.get("exclusion_reason") == "no_character")
+    stats["excluded_near_duplicate"] = sum(1 for item in report.get("excluded", []) if item.get("exclusion_reason") == "near_duplicate_lower_rank")
+    stats["excluded_below_cut_quality"] = sum(1 for item in report.get("excluded", []) if item.get("exclusion_reason") == "below_minimum_cut_quality")
+    stats["model_revision"] = str(getattr(models, "tag_revision", getattr(models, "revision", "unknown")))
+    stats["identity_model"] = None
+
+    private_report = {
+        "selection_mode": "automatic_character",
+        "model": {
+            "revision": stats.get("model_revision"),
+            "inference": "local ModelService.tag_many with require_gpu=True",
+            "character_presence": stats["character_presence_method"],
+            "identity_model_used": False,
+        },
+        "summary": report.get("summary", {}),
+        "settings": report.get("settings", {}),
+        "groups": report.get("groups", []),
+        "kept": [
+            {
+                key: _safe_json_value(value)
+                for key, value in item.items()
+                if key not in {"image", "tags", "detections"}
+            }
+            for item in report.get("kept", [])
+        ],
+        "excluded": [
+            {
+                key: _safe_json_value(value)
+                for key, value in item.items()
+                if key not in {"image", "tags", "detections"}
+            }
+            for item in report.get("excluded", [])
+        ],
+    }
+    try:
+        report_path = Path(cache_dir) / "curation-report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = report_path.with_suffix(".json.tmp")
+        temporary_path.write_text(json.dumps(private_report, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        temporary_path.replace(report_path)
+        stats["curation_report_saved"] = True
+    except (OSError, TypeError, ValueError) as error:
+        warnings.append(f"could not save private curation report: {error}")
+
+    results_root = Path(cache_dir) / "results"
+    candidates: list[dict[str, Any]] = []
+    kept = list(report.get("kept") or [])
+    kept.sort(key=lambda item: (-_as_number(item.get("cut_quality"), 0.0), _as_number(item.get("time"), 0.0), str(item.get("id", ""))))
+    for index, item in enumerate(kept):
+        if stop():
+            break
+        image = item["image"]
+        pts = int(item["pts"])
+        record = next((raw for raw in accepted_records if raw["id"] == item["id"]), None)
+        tags = record.get("tags", {}) if record else {}
+        detections = item.get("detections", [])
+        bbox = None
+        if detections:
+            selected_box = max(detections, key=lambda detector: _as_number(detector.get("score"), 0.0)).get("box")
+            if isinstance(selected_box, Sequence) and len(selected_box) == 4:
+                bbox = [float(value) for value in selected_box]
+        quality = record.get("quality_metrics") if record else None
+        if not isinstance(quality, Mapping):
+            quality = quality_metrics(image, bbox)
+        safe_id = _clean_filename(str(item.get("id", f"auto-{index}")))
+        preview_path = results_root / f"{safe_id}-preview.jpg"
+        crop_path = results_root / f"{safe_id}-crop.jpg"
+        if not _save_image(image, preview_path):
+            warnings.append(f"could not save preview for {item.get('id')}")
+        # No identity/face detector is invoked here, so the full source sample
+        # remains the honest crop shown in the UI.
+        if not _save_image(image, crop_path):
+            warnings.append(f"could not save crop for {item.get('id')}")
+        compact_tags = compact_tag_evidence(tags, threshold=tag_threshold)
+        condition = record.get("tag_condition", {}) if record else {}
+        candidates.append(
+            {
+                "id": str(item["id"]),
+                "pts": pts,
+                "time": _as_number(item.get("time"), 0.0),
+                "stream_index": _as_int(item.get("stream_index", 0), 0),
+                "bbox": bbox,
+                "selection_mode": "automatic_character",
+                "character_presence": bool(item.get("character_presence")),
+                "presence_score": _as_number(item.get("presence_score"), 0.0),
+                "presence_evidence": item.get("presence_evidence", {}),
+                "group_id": item.get("group_id"),
+                "cut_quality": _as_number(item.get("cut_quality"), 0.0),
+                "score": _as_number(item.get("cut_quality"), 0.0),
+                "quality": _as_number(quality.get("quality"), 0.0),
+                "condition": _as_number(condition.get("score"), 1.0),
+                "tag_score": _as_number(condition.get("score"), 1.0),
+                "tag_reasons": list(condition.get("reasons") or []),
+                "tags": {"subject": {}, "frame": compact_tags.get("general", {})},
+                "quality_metrics": quality,
+                "visual_metrics": item.get("visual_metrics", {}),
+                "preview_path": str(preview_path.resolve()),
+                "crop_path": str(crop_path.resolve()),
+            }
+        )
+    stats["returned"] = len(candidates)
+    stats["tag_scope"] = "frame; automatic presence mode does not claim person identity or per-person tag attribution"
+    _call_progress(progress, 1.0, "キャラクターカット候補の整理完了")
+    return {"candidates": candidates, "warnings": warnings, "stats": stats}
+
+
 def run_search(
     video_path: str,
     references: list[Any],
@@ -756,12 +1103,14 @@ def run_search(
     progress: Progress | None = None,
     cancelled: Cancelled | None = None,
 ) -> dict[str, Any]:
-    """Search *video_path* for reference-matching character crops.
+    """Search a video using explicit references or automatic character presence.
 
     Stages run as coarse sampling, local dense refinement around promising
     matches, near-frame refinement, then an optional global rescue scan when the
-    requested result count is still short.  The returned paths are local cache
-    paths; the HTTP layer can map them to URLs.
+    requested result count is still short in reference mode.  Automatic mode
+    instead tags sparse reduced-resolution samples and applies visual curation
+    without CCIP identity matching. Returned paths are local cache paths; the
+    HTTP layer can map them to URLs.
     """
 
     settings = settings or {}
@@ -807,6 +1156,21 @@ def run_search(
         if reason and reason not in warnings:
             warn_once(reason)
         return False
+
+    selection_mode = str(_first(settings, "selection_mode", "analysis_mode", default="reference")).strip().lower()
+    if selection_mode in {"automatic", "automatic_character", "character_presence"}:
+        return _run_automatic_character_search(
+            video_path,
+            wanted,
+            avoided,
+            settings,
+            models,
+            cache_dir,
+            progress,
+            cancelled,
+        )
+    if selection_mode not in {"reference", "reference_match"}:
+        raise PipelineError(f"unsupported selection mode: {selection_mode}")
 
     bundle = _resolve_model_bundle(models)
     if bundle is None:
@@ -886,7 +1250,10 @@ def run_search(
         stats["error"] = "empty_interval"
         return result_empty
 
-    target_count = max(1, _as_int(_first(settings, "candidate_count", "candidateCount", "target_count", "limit", default=30), 30))
+    target_count = max(0, _as_int(_first(settings, "candidate_count", "candidateCount", "target_count", "limit", default=30), 30))
+    # Keep the existing search refinement behavior when the caller asks for
+    # every result, while treating target_count=0 as an unlimited output list.
+    search_target = target_count or 30
     coarse_step = max(0.01, _as_number(_first(settings, "coarse_step", "coarseStep", default=2.0), 2.0))
     dense_step = max(0.005, _as_number(_first(settings, "dense_step", "denseStep", default=0.25), 0.25))
     fps = _as_number(_video_info_value(info, "fps", "frame_rate", "frameRate", default=0.0), 0.0)
@@ -900,7 +1267,10 @@ def run_search(
     quality_min = clamp01(_as_number(_first(settings, "quality_min", "qualityMin", default=0.0), 0.0))
     tag_threshold = clamp01(_as_number(_first(settings, "tag_threshold", "tagThreshold", default=0.17), 0.17))
     min_detection_score = clamp01(_as_number(_first(settings, "min_detection_score", "detection_threshold", default=0.0), 0.0))
-    max_tagged = max(target_count * 5, _as_int(_first(settings, "max_tagged", default=target_count * 8), target_count * 8))
+    max_tagged = (
+        max(target_count * 5, _as_int(_first(settings, "max_tagged", default=target_count * 8), target_count * 8))
+        if target_count > 0 else 0
+    )
     weights = normalize_weights(
         _first(settings, "weights", default={
             "identity": _first(settings, "identity_weight", "identityWeight", default=0.35),
@@ -929,6 +1299,9 @@ def run_search(
         warn_once(f"reference embedding failed: {error}")
         stats["error"] = "reference_embedding_failed"
         return result_empty
+    reference_groups = _reference_character_groups(settings, len(reference_images))
+    stats["selected_character_keys"] = [key for key, _indices in reference_groups if key]
+    stats["references_per_character"] = {key: len(indices) for key, indices in reference_groups if key}
 
     seen_frames: set[tuple[Any, int]] = set()
     raw_matches: list[dict[str, Any]] = []
@@ -1107,7 +1480,7 @@ def run_search(
         frame_pts = _as_int(_frame_value(frame, "pts", 0), 0)
         stream_index = _frame_value(frame, "stream_index", 0)
         for crop_index, (detection, crop, metrics, severe_overlap) in enumerate(valid_crops):
-            match = aggregate_reference_distances(distances[:, crop_index], identity_threshold)
+            match, character_key = _match_reference_groups(distances[:, crop_index], reference_groups, identity_threshold)
             if not match["accepted"]:
                 reject("identity_threshold")
                 continue
@@ -1124,6 +1497,7 @@ def run_search(
                     "distance": float(match["distance"]),
                     "identity": float(match["identity"]),
                     "corroboration": float(match["corroboration"]),
+                    "character_key": character_key,
                     "quality": float(metrics["quality"]),
                     "condition": float(metrics["condition"] * (0.55 if severe_overlap else 1.0)),
                     "score": float(preliminary),
@@ -1189,12 +1563,12 @@ def run_search(
         return centers
 
     if not stop() and not stats["budget_exhausted"]:
-        dense_centers = centers_from_matches(raw_matches, max(3, min(target_count * 3, 60)))
+        dense_centers = centers_from_matches(raw_matches, max(3, min(search_target * 3, 60)))
         dense_intervals = _intervals_around(dense_centers, max(coarse_step, dense_step * 2.0), start, end)
         sample_intervals(dense_intervals, dense_step, "dense", 0.25, 0.55)
 
     if not stop() and not stats["budget_exhausted"]:
-        near_centers = centers_from_matches(raw_matches, max(3, min(target_count * 2, 40)))
+        near_centers = centers_from_matches(raw_matches, max(3, min(search_target * 2, 40)))
         near_intervals = _intervals_around(near_centers, max(dense_step * 2.0, near_step * 3.0), start, end)
         sample_intervals(near_intervals, near_step, "near", 0.55, 0.74)
 
@@ -1215,7 +1589,7 @@ def run_search(
     # both the rescue-capacity signal and the input to expensive tag inference.
     pixel_diverse_matches = prepare_pixel_diverse_pool(raw_matches)
     pre_dedup_capacity = len(pixel_diverse_matches)
-    rescue_needed = len(raw_matches) < max(target_count * 2, target_count + 4) or pre_dedup_capacity < target_count
+    rescue_needed = len(raw_matches) < max(search_target * 2, search_target + 4) or pre_dedup_capacity < search_target
     if rescue_enabled and rescue_needed and not stop() and not stats["budget_exhausted"]:
         sample_intervals([(start, end)], rescue_step, "rescue", 0.74, 0.90)
 
@@ -1238,7 +1612,8 @@ def run_search(
     frame_tag_requests = [
         item for item in [*(wanted or []), *(avoided or [])] if str(item.get("scope", "subject")).lower() == "frame"
     ]
-    for index, candidate in enumerate(prelim_matches[:max_tagged]):
+    candidates_to_tag = prelim_matches[:max_tagged] if max_tagged > 0 else prelim_matches
+    for index, candidate in enumerate(candidates_to_tag):
         if stop():
             break
         subject_tags: Mapping[str, Any] = {}
@@ -1303,7 +1678,7 @@ def run_search(
             },
         )
         tagged_matches.append(candidate)
-        _call_progress(progress, 0.90 + 0.09 * (index + 1) / max(1, min(max_tagged, len(prelim_matches))), "tag and rank")
+        _call_progress(progress, 0.90 + 0.09 * (index + 1) / max(1, len(candidates_to_tag)), "tag and rank")
 
     # Apply the one-result-per-PTS export policy only after desired/avoided tag
     # gating and final score calculation, so a distinct person can satisfy a
@@ -1312,14 +1687,25 @@ def run_search(
     tagged_matches = _collapse_matches_per_pts(tagged_matches)
     same_pts_collapsed += before_pts_collapse - len(tagged_matches)
 
-    deduped = deduplicate_candidates(
-        tagged_matches,
-        hash_distance=max(0, _as_int(_first(settings, "dedup_hash_distance", default=6), 6)),
-        time_window=max(0.0, _as_number(_first(settings, "dedup_time_window", default=0.55), 0.55)),
-    )
+    # Near-duplicate removal stays per selected character: a frame kept for
+    # one selected character must not suppress the other character's cut.
+    by_character: dict[Any, list[dict[str, Any]]] = {}
+    for item in tagged_matches:
+        by_character.setdefault(item.get("character_key"), []).append(item)
+    deduped = []
+    for character_items in by_character.values():
+        deduped.extend(
+            deduplicate_candidates(
+                character_items,
+                hash_distance=max(0, _as_int(_first(settings, "dedup_hash_distance", default=6), 6)),
+                time_window=max(0.0, _as_number(_first(settings, "dedup_time_window", default=0.55), 0.55)),
+            )
+        )
+    deduped.sort(key=lambda item: (-float(item.get("score", 0.0)), float(item.get("time", 0.0)), str(item.get("id", ""))))
     output_candidates: list[dict[str, Any]] = []
     output_root = root / "results"
-    for candidate in deduped[:target_count]:
+    output_pool = _candidate_output_pool(deduped, target_count)
+    for candidate in output_pool:
         if stop():
             break
         safe_id = _clean_filename(str(candidate["id"]))
@@ -1339,6 +1725,7 @@ def run_search(
                 "identity": float(candidate["identity"]),
                 "distance": float(candidate["distance"]),
                 "corroboration": float(candidate.get("corroboration", 0.0)),
+                "character_key": candidate.get("character_key"),
                 "quality": float(candidate["quality"]),
                 "condition": float(candidate["condition"]),
                 "uncertain": bool(candidate.get("_severe_overlap", False)),
@@ -1351,7 +1738,7 @@ def run_search(
                 "crop_path": str(crop_path.resolve()),
             }
         )
-    shortage = max(0, target_count - len(output_candidates))
+    shortage = max(0, target_count - len(output_candidates)) if target_count > 0 else 0
     if shortage:
         if not raw_matches:
             shortage_reason = "no_identity_match"
@@ -1373,7 +1760,7 @@ def run_search(
             "same_pts_collapsed": same_pts_collapsed,
             "pre_dedup_capacity": pre_dedup_capacity,
             "pixel_diverse_pool": len(pixel_diverse_matches),
-            "tagged_pool": min(len(pixel_diverse_matches), max_tagged),
+            "tagged_pool": min(len(pixel_diverse_matches), max_tagged) if max_tagged > 0 else len(pixel_diverse_matches),
             "tagged_matches": len(tagged_matches),
             "deduped": len(deduped),
             "metrics": {

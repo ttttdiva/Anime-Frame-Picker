@@ -9,8 +9,20 @@
     videos: [],
     currentVideo: null,
     videoObjectUrl: null,
+    suggestions: [],
+    suggestionCards: new Map(),
+    suggestionPage: 0,
+    suggestionTimes: new Set(),
+    selectedSuggestionKeys: new Set(),
+    characters: [],
+    characterLabels: new Map(),
+    selectedMembers: new Map(),
+    suggestionLoading: false,
+    suggestionToken: 0,
     references: [],
     selectedReferenceId: null,
+    referenceScope: 'subject',
+    sampleSteps: { automatic: 1, reference: 2 },
     wanted: [],
     avoided: [],
     intent: 'wanted',
@@ -46,28 +58,32 @@
   const els = {
     globalNotice: $('globalNotice'), modelStatus: $('modelStatus'), shortcutButton: $('shortcutButton'),
     videoSelect: $('videoSelect'), videoFile: $('videoFile'), videoMeta: $('videoMeta'), videoPreview: $('videoPreview'),
+    selectionModeAutomatic: $('selectionModeAutomatic'), selectionModeReference: $('selectionModeReference'), referenceControls: $('referenceControls'), referenceCropPanel: $('referenceCropPanel'),
     referenceFiles: $('referenceFiles'), referenceTime: $('referenceTime'), captureReference: $('captureReference'),
+    suggestFrames: $('suggestFrames'), addSuggestedFrames: $('addSuggestedFrames'), suggestedSelectionCount: $('suggestedSelectionCount'),
+    suggestionStatus: $('suggestionStatus'), suggestionGrid: $('suggestionGrid'), moreSuggestedFrames: $('moreSuggestedFrames'),
     referenceList: $('referenceList'), referenceCount: $('referenceCount'),
     cropEmpty: $('cropEmpty'), cropStage: $('cropStage'), referenceCanvas: $('referenceCanvas'), cropReadout: $('cropReadout'),
     resetCrop: $('resetCrop'), selectedReferenceName: $('selectedReferenceName'),
     wantedTab: $('wantedTab'), avoidedTab: $('avoidedTab'), tagSearch: $('tagSearch'), tagSearchSpinner: $('tagSearchSpinner'),
-    scopeButtons: [...document.querySelectorAll('.scope-button')], tagSuggestions: $('tagSuggestions'), tagWarning: $('tagWarning'),
+    scopeButtons: [...document.querySelectorAll('.scope-button')], tagScopeHelp: $('tagScopeHelp'), tagSuggestions: $('tagSuggestions'), tagWarning: $('tagWarning'),
     wantedTags: $('wantedTags'), avoidedTags: $('avoidedTags'), wantedCount: $('wantedCount'), avoidedCount: $('avoidedCount'), bucketTitle: $('bucketTitle'),
     summaryVideo: $('summaryVideo'), summaryReference: $('summaryReference'), summaryTags: $('summaryTags'), readyBadge: $('readyBadge'), analyzeButton: $('analyzeButton'),
     logoRemovalToggle: $('logoRemovalToggle'), logoProfileSelect: $('logoProfileSelect'), logoProfileStatus: $('logoProfileStatus'), logoProfileEmpty: $('logoProfileEmpty'), logoModelBadge: $('logoModelBadge'),
-    startTime: $('startTime'), endTime: $('endTime'), coarseStep: $('coarseStep'), denseStep: $('denseStep'), candidateCount: $('candidateCount'),
-    identityThreshold: $('identityThreshold'), tagThreshold: $('tagThreshold'), qualityMin: $('qualityMin'), rescue: $('rescue'),
+    startTime: $('startTime'), endTime: $('endTime'), coarseStep: $('coarseStep'), denseStep: $('denseStep'), candidateCount: $('candidateCount'), sampleStepLabel: $('sampleStepLabel'),
+    denseStepControl: $('denseStepControl'), candidateCountControl: $('candidateCountControl'), identityThresholdControl: $('identityThresholdControl'), qualityMinControl: $('qualityMinControl'), cutQualityMinControl: $('cutQualityMinControl'), referenceRescueControl: $('referenceRescueControl'), referenceWeightControls: $('referenceWeightControls'),
+    identityThreshold: $('identityThreshold'), tagThreshold: $('tagThreshold'), qualityMin: $('qualityMin'), cutQualityMin: $('cutQualityMin'), rescue: $('rescue'),
     identityWeight: $('identityWeight'), conditionWeight: $('conditionWeight'), qualityWeight: $('qualityWeight'), weightTotal: $('weightTotal'),
     resultsPanel: $('resultsPanel'), progressArea: $('progressArea'), progressMessage: $('progressMessage'), progressPercent: $('progressPercent'), progressBar: $('progressBar'), cancelJob: $('cancelJob'),
-    shortageNotice: $('shortageNotice'), resultsEmpty: $('resultsEmpty'), resultsGrid: $('resultsGrid'), resultCount: $('resultCount'), clearSelection: $('clearSelection'), compareButton: $('compareButton'), exportButton: $('exportButton'),
+    shortageNotice: $('shortageNotice'), resultsEmpty: $('resultsEmpty'), resultsGrid: $('resultsGrid'), resultCount: $('resultCount'), runInfo: $('runInfo'), clearSelection: $('clearSelection'), compareButton: $('compareButton'), exportButton: $('exportButton'),
     selectedCount: $('selectedCount'), evidenceEmpty: $('evidenceEmpty'), evidenceDetail: $('evidenceDetail'), evidenceImage: $('evidenceImage'), evidenceCrop: $('evidenceCrop'), evidenceBox: $('evidenceBox'),
     evidencePosition: $('evidencePosition'), prevCandidate: $('prevCandidate'), nextCandidate: $('nextCandidate'), evidenceEnlarge: $('evidenceEnlarge'), evidenceMeta: $('evidenceMeta'),
     compareModal: $('compareModal'), compareKicker: $('compareKicker'), compareTitle: $('compareTitle'), compareContent: $('compareContent'), shortcutModal: $('shortcutModal'), toast: $('toast'),
   };
 
   const fallbackSettings = {
-    start: 0, end: 0, coarse_step: 2, dense_step: 0.25, candidate_count: 30,
-    identity_threshold: 0.213231, tag_threshold: 0.17, quality_min: 0.15, rescue: true,
+    start: 0, end: 0, coarse_step: 2, auto_sample_step: 1, dense_step: 0.25, candidate_count: 0,
+    identity_threshold: 0.213231, tag_threshold: 0.17, quality_min: 0.15, cut_quality_min: 0.55, rescue: true,
     identity_weight: 0.35, condition_weight: 0.3, quality_weight: 0.35,
   };
 
@@ -75,6 +91,7 @@
 
   async function init() {
     bindEvents();
+    updateSelectionMode();
     updateWeightTotal();
     renderTags();
     updateSummary();
@@ -86,11 +103,103 @@
     await loadLogoProfiles();
   }
 
+  // Independent read-only view. It never calls character-suggestions or jobs.
+  function bindAcceptedCatalogue() {
+    const pane = $('acceptedPanel');
+    if (!pane) return;
+    let ready = false, busy = false, next = null, current = '', history = [], filters = null;
+    const workspace = document.querySelector('main.workspace');
+    const status = $('acceptedStatus'), results = $('acceptedResults');
+    const previousButton = $('acceptedPrevious'), nextButton = $('acceptedNext');
+    const controls = [...$('acceptedSearchForm').elements];
+    const updateButtons = () => {
+      previousButton.disabled = busy || !history.length;
+      nextButton.disabled = busy || !next;
+      controls.forEach((control) => { control.disabled = busy; });
+      $('acceptedSuggestions').querySelectorAll('button').forEach((button) => { button.disabled = busy; });
+    };
+    const get = async (url) => {
+      const response = await fetch(url, { method: 'GET' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'Catalogue unavailable');
+      return data;
+    };
+    const loadPage = async (cursor, direction = 'reset') => {
+      if (busy) return;
+      busy = true; updateButtons(); status.textContent = '保存済みカタログを検索中…';
+      try {
+        const params = new URLSearchParams({ ...filters, cursor, limit: '40' });
+        const page = await get(`/api/accepted-catalogue/frames?${params}`);
+        if (direction === 'next') history.push(current);
+        else if (direction === 'previous') history.pop();
+        else history = [];
+        current = cursor; next = page.next_cursor;
+        results.replaceChildren();
+        for (const frame of page.items) {
+          const card = document.createElement('article'); card.className = 'accepted-card';
+          card.dataset.frameId = frame.stable_id; card.dataset.nativeOrigin = frame.native_origin;
+          const link = document.createElement('a'); link.href = frame.image_url; link.target = '_blank'; link.rel = 'noopener';
+          const image = document.createElement('img'); image.src = frame.image_url; image.loading = 'lazy'; image.decoding = 'async';
+          image.width = frame.width; image.height = frame.height; image.alt = `${frame.source_name} · ${frame.raw_id}`;
+          const title = document.createElement('strong'); title.textContent = frame.source_name;
+          const detail = document.createElement('p'); detail.textContent = `row ${frame.row_key} · PTS ${frame.pts} · ${frame.width}×${frame.height}`;
+          const open = document.createElement('span'); open.textContent = 'ネイティブPNGを開く';
+          link.append(image, open); card.append(title, detail, link);
+          if (!frame.tags_available) { const note = document.createElement('p'); note.textContent = 'フルタグキャッシュ欠落'; card.append(note); }
+          results.append(card);
+        }
+        const first = page.items.length ? page.offset + 1 : 0;
+        $('acceptedCount').textContent = `${page.total.toLocaleString('ja-JP')} 件 · ${first}–${page.offset + page.items.length}`;
+        status.textContent = page.release ? `Release ${page.release} · ${page.full_search_complete ? 'フルタグキャッシュ照合済み' : 'フルタグに欠落あり（検索は不完全）'}` : '採用カタログはまだ登録されていません。';
+      } catch (error) {
+        results.replaceChildren(); $('acceptedCount').textContent = ''; next = null; history = []; current = '';
+        status.textContent = `採用カタログ: ${error.message}`;
+      } finally { busy = false; updateButtons(); }
+    };
+    const search = () => {
+      filters = { q: $('acceptedQuery').value, row: $('acceptedRow').value,
+        tag_category: $('acceptedCategory').value, min_score: $('acceptedMinScore').value };
+      return loadPage('');
+    };
+    $('acceptedEntry').addEventListener('click', async () => {
+      pane.classList.remove('hidden'); workspace.classList.add('hidden');
+      $('acceptedEntry').setAttribute('aria-expanded', 'true');
+      if (ready || busy) return;
+      busy = true; updateButtons(); status.textContent = '保存済みカタログの整合性を確認中…（起動直後の初回は時間がかかります）';
+      try {
+        const summary = await get('/api/accepted-catalogue');
+        for (const row of summary.rows) { const option = document.createElement('option'); option.value = row.key; option.textContent = `${row.key}: ${row.name} (${row.count})`; $('acceptedRow').append(option); }
+        for (const category of summary.categories) { const option = document.createElement('option'); option.value = category; option.textContent = category; $('acceptedCategory').append(option); }
+        for (const suggestion of summary.suggestions || []) {
+          const button = document.createElement('button'); button.type = 'button'; button.className = 'ghost-button';
+          button.textContent = `${suggestion.tag} (${suggestion.count})`;
+          button.addEventListener('click', () => { $('acceptedQuery').value = suggestion.tag; $('acceptedCategory').value = suggestion.category; search(); });
+          $('acceptedSuggestions').append(button);
+        }
+        ready = true;
+      } catch (error) { status.textContent = `採用カタログ: ${error.message}`; }
+      finally { busy = false; updateButtons(); }
+      if (ready) await search();
+    });
+    $('acceptedClose').addEventListener('click', () => {
+      pane.classList.add('hidden'); workspace.classList.remove('hidden');
+      $('acceptedEntry').setAttribute('aria-expanded', 'false');
+    });
+    $('acceptedSearchForm').addEventListener('submit', (event) => { event.preventDefault(); if (!busy) search(); });
+    nextButton.addEventListener('click', () => { if (next) loadPage(next, 'next'); });
+    previousButton.addEventListener('click', () => { if (history.length) loadPage(history[history.length - 1], 'previous'); });
+  }
+
   function bindEvents() {
+    bindAcceptedCatalogue();
+    document.querySelectorAll('input[name="selectionMode"]').forEach((input) => input.addEventListener('change', updateSelectionMode));
     els.videoSelect.addEventListener('change', () => inspectSelectedVideo());
     els.videoFile.addEventListener('change', uploadVideo);
     els.referenceFiles.addEventListener('change', uploadReferences);
     els.captureReference.addEventListener('click', captureReferenceFromVideo);
+    els.suggestFrames.addEventListener('click', () => loadSuggestedFrames(false));
+    els.moreSuggestedFrames.addEventListener('click', () => loadSuggestedFrames(false));
+    els.addSuggestedFrames.addEventListener('click', addSelectedSuggestedReferences);
     els.resetCrop.addEventListener('click', resetCrop);
     els.referenceCanvas.addEventListener('pointerdown', beginCrop);
     els.referenceCanvas.addEventListener('pointermove', moveCrop);
@@ -99,6 +208,7 @@
     els.wantedTab.addEventListener('click', () => setIntent('wanted'));
     els.avoidedTab.addEventListener('click', () => setIntent('avoided'));
     els.scopeButtons.forEach((button) => button.addEventListener('click', () => setScope(button.dataset.scope)));
+    els.coarseStep.addEventListener('input', () => { state.sampleSteps[currentSelectionMode()] = getNumber(els.coarseStep, currentSelectionMode() === 'automatic' ? 1 : 2); });
     els.tagSearch.addEventListener('input', scheduleVocabularySearch);
     els.tagSearch.addEventListener('keydown', handleTagKeydown);
     els.analyzeButton.addEventListener('click', startAnalysis);
@@ -320,12 +430,15 @@
     const source = Object.assign({}, fallbackSettings, settings || {});
     setInputValue(els.startTime, source.start);
     setInputValue(els.endTime, source.end);
-    setInputValue(els.coarseStep, source.coarse_step);
+    state.sampleSteps.reference = Number(source.coarse_step) > 0 ? Number(source.coarse_step) : 2;
+    state.sampleSteps.automatic = Number(source.auto_sample_step) > 0 ? Number(source.auto_sample_step) : 1;
+    setInputValue(els.coarseStep, state.sampleSteps[currentSelectionMode()]);
     setInputValue(els.denseStep, source.dense_step);
     setInputValue(els.candidateCount, source.candidate_count);
     setInputValue(els.identityThreshold, source.identity_threshold);
     setInputValue(els.tagThreshold, source.tag_threshold);
     setInputValue(els.qualityMin, source.quality_min);
+    setInputValue(els.cutQualityMin, source.cut_quality_min);
     setInputValue(els.identityWeight, source.identity_weight);
     setInputValue(els.conditionWeight, source.condition_weight);
     setInputValue(els.qualityWeight, source.quality_weight);
@@ -367,11 +480,13 @@
     const path = els.videoSelect.value;
     const token = ++state.videoRequestToken;
     if (!path) {
+      resetSuggestions();
       state.currentVideo = null;
       state.videoLoading = false;
       updateVideoView();
       return;
     }
+    resetSuggestions();
     state.currentVideo = null;
     state.videoLoading = true;
     updateVideoView();
@@ -428,12 +543,22 @@
   function setCurrentVideo(data, objectUrl, fallbackPath) {
     const info = data && data.info ? data.info : data || {};
     const videoId = data && (data.video_id || data.id) || info.video_id || fallbackPath;
+    if (!state.currentVideo || state.currentVideo.video_id !== videoId) resetSuggestions();
     state.currentVideo = { video_id: videoId, info, path: info.path || fallbackPath, name: info.name || basename(info.path || fallbackPath || '') };
     if (state.videoObjectUrl) URL.revokeObjectURL(state.videoObjectUrl);
     state.videoObjectUrl = objectUrl;
     state.videoLoading = false;
     updateVideoView();
     updateCaptureAvailability();
+    maybeAutoSuggest();
+  }
+
+  function maybeAutoSuggest() {
+    // Default flow: selecting a video immediately presents likely characters.
+    if (currentSelectionMode() !== 'reference' || !state.currentVideo || state.suggestionLoading) return;
+    if (state.characters.length || state.suggestionPage > 0) return;
+    if (!(Number(state.currentVideo.info && state.currentVideo.info.duration) > 0)) return;
+    loadSuggestedFrames();
   }
 
   function updateVideoView() {
@@ -444,6 +569,7 @@
       els.videoPreview.classList.add('hidden');
       els.summaryVideo.textContent = '未選択';
       updateCaptureAvailability();
+      updateSuggestionControls();
       return;
     }
     const info = video.info || {};
@@ -457,6 +583,241 @@
       els.videoPreview.removeAttribute('src');
       els.videoPreview.classList.add('hidden');
     }
+    updateSuggestionControls();
+  }
+
+  function resetSuggestions() {
+    state.suggestionToken += 1;
+    state.suggestions = [];
+    state.suggestionCards.clear();
+    state.suggestionPage = 0;
+    state.suggestionTimes.clear();
+    state.selectedSuggestionKeys.clear();
+    state.characters = [];
+    state.characterLabels.clear();
+    state.selectedMembers.clear();
+    state.suggestionLoading = false;
+    if (els.suggestionGrid) {
+      els.suggestionGrid.innerHTML = '';
+      els.suggestionGrid.classList.add('hidden');
+    }
+    if (els.suggestionStatus) els.suggestionStatus.textContent = state.currentVideo ? '候補を表示できます。' : '動画を選ぶと、候補フレームを表示できます。';
+    if (els.moreSuggestedFrames) els.moreSuggestedFrames.classList.add('hidden');
+    updateSuggestionControls();
+  }
+
+  function updateSuggestionControls() {
+    if (!els.suggestFrames) return;
+    const hasVideo = Boolean(state.currentVideo && state.currentVideo.video_id && Number(state.currentVideo.info && state.currentVideo.info.duration) > 0);
+    els.suggestFrames.disabled = !hasVideo || state.suggestionLoading;
+    els.suggestFrames.textContent = state.characters.length ? 'ほかの候補も表示' : 'キャラ候補を表示';
+    const selectedCount = state.selectedMembers.size;
+    els.suggestedSelectionCount.textContent = String(selectedCount);
+    els.addSuggestedFrames.disabled = !hasVideo || state.suggestionLoading || selectedCount === 0;
+    els.moreSuggestedFrames.disabled = state.suggestionLoading;
+  }
+
+  function vanDerCorput(index) {
+    let value = 0;
+    let denominator = 1;
+    let current = index;
+    while (current > 0) {
+      denominator *= 2;
+      value += (current % 2) / denominator;
+      current = Math.floor(current / 2);
+    }
+    return value;
+  }
+
+  async function loadSuggestedFrames() {
+    if (!state.currentVideo || state.suggestionLoading) return;
+    const duration = Number(state.currentVideo.info && state.currentVideo.info.duration);
+    if (!Number.isFinite(duration) || duration <= 0) {
+      els.suggestionStatus.textContent = '動画の長さを取得できないため、候補を表示できません。';
+      return;
+    }
+    const token = ++state.suggestionToken;
+    const page = state.suggestionPage;
+    const offset = vanDerCorput(page + 1);
+    const batchSize = 12;
+    const newSamples = [];
+    for (let index = 0; index < batchSize; index += 1) {
+      const time = duration * (index + offset) / batchSize;
+      const key = `${state.currentVideo.video_id}:${Math.round(time * 1000)}`;
+      if (state.suggestionTimes.has(key)) continue;
+      state.suggestionTimes.add(key);
+      newSamples.push({ key, time });
+    }
+    if (!newSamples.length) {
+      els.suggestionStatus.textContent = 'この動画で新しいサンプル時点がなくなりました。結果数や候補キャラ数の上限ではありません。';
+      els.moreSuggestedFrames.classList.add('hidden');
+      return;
+    }
+    state.suggestionLoading = true;
+    updateSuggestionControls();
+    els.suggestionStatus.textContent = `${state.currentVideo.name} から候補フレームを準備しています…`;
+    try {
+      const data = await api(`/api/videos/${encodeURIComponent(state.currentVideo.video_id)}/character-suggestions`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page, times: newSamples.map((sample) => sample.time) }),
+      });
+      if (token !== state.suggestionToken) return;
+      const knownPts = new Set(state.suggestions.map((frame) => frame.pts));
+      const freshPts = new Set(knownPts);
+      const frames = (Array.isArray(data && data.frames) ? data.frames : []).filter((frame) => {
+        const pts = Number(frame.pts);
+        if (!Number.isInteger(pts) || !Array.isArray(frame.detections) || !frame.detections.length || freshPts.has(pts)) return false;
+        freshPts.add(pts);
+        return true;
+      });
+      frames.forEach((frame) => {
+        const pts = Number(frame.pts);
+        state.suggestions.push({
+          key: `${state.currentVideo.video_id}:pts-${pts}`,
+          pts,
+          time: Number(frame.time) || 0,
+          detections: frame.detections,
+          url: frame.preview_url || `/api/videos/${encodeURIComponent(state.currentVideo.video_id)}/frame-preview?pts=${encodeURIComponent(pts)}`,
+          source: frame.source || data.detector || 'person_head',
+        });
+      });
+      state.suggestionPage += 1;
+      if (Array.isArray(data && data.characters)) state.characters = data.characters.filter((group) => group && typeof group.character_key === 'string' && Array.isArray(group.members) && group.members.length);
+      renderSuggestedFrames();
+      const checked = Number(data && data.checked_frames) || newSamples.length;
+      const grouping = data && data.identity_grouping ? '既存CCIPで同じキャラらしい検出をまとめています（服装・表情・角度では分けません）。' : '同一キャラの判定ができないため、検出ごとに表示しています。';
+      if (!state.characters.length) {
+        els.suggestionStatus.textContent = `${checked}時点を検査しましたが、キャラ候補が見つかりませんでした。「ほかの候補も表示」で別の時点を検査できます。`;
+      } else if (data.detector === 'archived_detector_ccip') {
+        els.suggestionStatus.textContent = `${state.characters.length}件の候補を過去のdetector結果から表示しています。${grouping}`;
+      } else {
+        els.suggestionStatus.textContent = `${state.characters.length}人のキャラ候補（${frames.length}フレームで検出）。${grouping}画像を1枚以上選ぶと、そのキャラの良いカットを抽出します。`;
+      }
+      els.moreSuggestedFrames.classList.remove('hidden');
+    } catch (error) {
+      newSamples.forEach((sample) => state.suggestionTimes.delete(sample.key));
+      els.suggestionStatus.textContent = `キャラ候補の解析に失敗しました: ${error.message}`;
+      els.moreSuggestedFrames.classList.remove('hidden');
+    } finally {
+      if (token === state.suggestionToken) {
+        state.suggestionLoading = false;
+        updateSuggestionControls();
+      }
+    }
+  }
+
+  function renderSuggestedFrames() {
+    // Candidate characters are identified only by their stable server key;
+    // display position can change as "show more" adds crops.
+    els.suggestionGrid.classList.toggle('hidden', state.characters.length === 0);
+    els.suggestionGrid.textContent = '';
+    state.characters.forEach((group) => els.suggestionGrid.appendChild(createCharacterCard(group)));
+  }
+
+  function characterLabel(key) {
+    if (!key) return '';
+    if (key === 'manual') return '手動参照';
+    if (!state.characterLabels.has(key)) state.characterLabels.set(key, `キャラ${state.characterLabels.size + 1}`);
+    return state.characterLabels.get(key);
+  }
+
+  function createCharacterCard(group) {
+    const key = String(group.character_key || '');
+    const selectedInGroup = [...state.selectedMembers.values()].filter((member) => member.character_key === key).length;
+    const card = document.createElement('article');
+    card.className = `suggestion-card character-card${selectedInGroup ? ' selected' : ''}`;
+    card.dataset.characterKey = key;
+    const head = document.createElement('div');
+    head.className = 'character-card-head';
+    const title = document.createElement('strong');
+    title.textContent = `${characterLabel(key)} の候補`;
+    const meta = document.createElement('span');
+    meta.textContent = `${Number(group.frame_count) || 0}フレーム${selectedInGroup ? ` · ${selectedInGroup}枚選択中` : ''}`;
+    head.append(title, meta);
+    const members = document.createElement('div');
+    members.className = 'character-members';
+    (Array.isArray(group.members) ? group.members : []).forEach((member, index) => members.appendChild(createMemberButton(key, member, index === 0)));
+    card.append(head, members);
+    return card;
+  }
+
+  function createMemberButton(characterKey, member, isRepresentative) {
+    const detectionKey = String(member.detection_key || '');
+    const selected = state.selectedMembers.has(detectionKey);
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `character-member${selected ? ' selected' : ''}${isRepresentative ? ' representative' : ''}`;
+    button.dataset.detectionKey = detectionKey;
+    button.dataset.characterKey = characterKey;
+    button.setAttribute('aria-pressed', String(selected));
+    const image = document.createElement('img');
+    image.src = member.preview_url || '';
+    image.alt = `${characterLabel(characterKey)} ${formatTime(member.time)}`;
+    image.loading = 'lazy';
+    const caption = document.createElement('span');
+    caption.textContent = `${isRepresentative ? '代表 · ' : ''}${formatTime(member.time)}${selected ? ' · 選択中 ✓' : ''}`;
+    button.append(image, caption);
+    button.addEventListener('click', () => toggleCandidateMember(characterKey, member));
+    return button;
+  }
+
+  function toggleCandidateMember(characterKey, member) {
+    const key = String(member.detection_key || '');
+    if (!key) return;
+    if (state.selectedMembers.has(key)) {
+      state.selectedMembers.delete(key);
+      // Deselection reaches extraction: drop a reference made from this crop.
+      const before = state.references.length;
+      state.references = state.references.filter((reference) => reference.sourceSuggestionKey !== key);
+      if (state.references.length !== before) {
+        if (!state.references.some((reference) => reference.id === state.selectedReferenceId)) state.selectedReferenceId = state.references.length ? state.references[0].id : null;
+        renderReferences(); drawCrop();
+      }
+    } else {
+      state.selectedMembers.set(key, { detection_key: key, character_key: characterKey, pts: Number(member.pts), time: Number(member.time) || 0, box: member.box, kind: member.kind });
+    }
+    renderSuggestedFrames();
+    updateSuggestionControls();
+    updateSummary();
+  }
+
+  function detectionKindLabel(kind) {
+    if (kind === 'head') return '頭部';
+    if (kind === 'cached_crop') return '過去の検出crop';
+    return '人物';
+  }
+
+  async function addSelectedSuggestedReferences() {
+    const pending = [...state.selectedMembers.values()].filter((member) => !state.references.some((reference) => reference.sourceSuggestionKey === member.detection_key));
+    if (!pending.length || !state.currentVideo) return true;
+    const videoId = state.currentVideo.video_id;
+    const token = state.suggestionToken;
+    state.suggestionLoading = true;
+    setBusy(els.addSuggestedFrames, true);
+    updateSuggestionControls();
+    let ok = true;
+    try {
+      for (const member of pending) {
+        if (token !== state.suggestionToken || !state.currentVideo || state.currentVideo.video_id !== videoId) { ok = false; break; }
+        const data = await api(`/api/videos/${encodeURIComponent(videoId)}/reference`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pts: member.pts, box: member.box }),
+        });
+        if (token !== state.suggestionToken || !state.currentVideo || state.currentVideo.video_id !== videoId) { ok = false; break; }
+        addReference(Object.assign({}, data, { name: `${characterLabel(member.character_key)} ${formatTime(member.time)} PTS ${member.pts}` }), { sourceSuggestionKey: member.detection_key, characterKey: member.character_key, sourcePts: member.pts });
+      }
+    } catch (error) {
+      ok = false;
+      if (token === state.suggestionToken) showNotice(`選んだ候補を参照にできませんでした: ${error.message}`, 'error');
+    } finally {
+      if (token === state.suggestionToken) {
+        state.suggestionLoading = false;
+        setBusy(els.addSuggestedFrames, false);
+        renderSuggestedFrames();
+        updateSuggestionControls();
+      }
+    }
+    return ok;
   }
 
   async function uploadReferences(event) {
@@ -479,12 +840,15 @@
     }
   }
 
-  function addReference(raw) {
+  function addReference(raw, options = {}) {
     if (!raw) return;
     const id = String(raw.id || raw.reference_id || `ref-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     const reference = {
       id, url: raw.url || raw.preview_url || raw.path || '', width: raw.width || 0, height: raw.height || 0,
-      name: raw.name || raw.filename || `参照 ${state.references.length + 1}`, box: null, image: null,
+      name: raw.name || raw.filename || `参照 ${state.references.length + 1}`, box: raw.box || null, image: null,
+      sourceSuggestionKey: options.sourceSuggestionKey || null,
+      characterKey: options.characterKey || null,
+      sourcePts: Number.isInteger(options.sourcePts) ? options.sourcePts : null,
     };
     state.references.push(reference);
     if (!state.selectedReferenceId) state.selectedReferenceId = id;
@@ -682,7 +1046,9 @@
 
   function setScope(scope) {
     if (scope !== 'subject' && scope !== 'frame') return;
+    if (currentSelectionMode() === 'automatic' && scope === 'subject') return;
     state.scope = scope;
+    if (currentSelectionMode() === 'reference') state.referenceScope = scope;
     els.scopeButtons.forEach((button) => button.classList.toggle('active', button.dataset.scope === scope));
   }
 
@@ -816,11 +1182,23 @@
   function hideSuggestions() { els.tagSuggestions.classList.add('hidden'); }
 
   async function startAnalysis() {
+    // Selected candidate images become references automatically: the normal
+    // flow is choose characters -> analyze, with no separate add step.
+    if (currentSelectionMode() === 'reference' && state.selectedMembers.size) {
+      const added = await addSelectedSuggestedReferences();
+      if (!added) return;
+    }
     const error = validateBeforeAnalysis();
     if (error) { showNotice(error, 'warning'); return; }
     const body = {
       video_id: state.currentVideo.video_id,
-      references: state.references.map((reference) => ({ id: reference.id, box: reference.box || null })),
+      selection_mode: currentSelectionMode(),
+      references: currentSelectionMode() === 'reference' ? state.references.map((reference) => ({
+        id: reference.id,
+        box: reference.box || null,
+        character_key: reference.characterKey || undefined,
+        source_pts: reference.sourcePts === null ? undefined : reference.sourcePts,
+      })) : [],
       wanted: state.wanted.map((item) => ({ tag: item.tag, scope: item.scope })),
       avoided: state.avoided.map((item) => ({ tag: item.tag, scope: item.scope })),
       settings: collectSettings(),
@@ -840,16 +1218,39 @@
 
   function validateBeforeAnalysis() {
     if (!state.currentVideo || !state.currentVideo.video_id) return '動画を選択してください。';
-    if (!state.references.length) return '参照画像を1枚以上追加してください。';
-    const count = clamp(Math.round(getNumber(els.candidateCount, 30)), 20, 50);
+    if (currentSelectionMode() === 'reference' && !state.references.length) return 'キャラ候補から画像を1枚以上選んでください（同じキャラの複数枚・複数キャラも選べます）。';
+    if (currentSelectionMode() === 'automatic' && [...state.wanted, ...state.avoided].some((item) => item.scope === 'subject')) return '自動選別のタグ条件はフレーム全体に適用します。「対象 crop」条件が残っているため、そのタグを削除するか参照検索へ切り替えてください。';
+    const count = Math.max(0, Math.round(getNumber(els.candidateCount, 0)));
     els.candidateCount.value = count;
     return '';
   }
 
+  function currentSelectionMode() { return els.selectionModeReference && els.selectionModeReference.checked ? 'reference' : 'automatic'; }
+
+  function updateSelectionMode() {
+    const referenceMode = currentSelectionMode() === 'reference';
+    els.referenceControls.classList.toggle('hidden', !referenceMode);
+    els.referenceCropPanel.classList.toggle('hidden', !referenceMode);
+    [els.denseStepControl, els.candidateCountControl, els.identityThresholdControl, els.qualityMinControl, els.referenceRescueControl, els.referenceWeightControls]
+      .forEach((node) => node.classList.toggle('hidden', !referenceMode));
+    els.cutQualityMinControl.classList.toggle('hidden', referenceMode);
+    state.scope = referenceMode ? state.referenceScope : 'frame';
+    els.scopeButtons.forEach((button) => {
+      const isSubject = button.dataset.scope === 'subject';
+      button.disabled = !referenceMode && isSubject;
+      button.classList.toggle('active', button.dataset.scope === state.scope);
+    });
+    els.tagScopeHelp.classList.toggle('hidden', referenceMode);
+    setInputValue(els.coarseStep, state.sampleSteps[referenceMode ? 'reference' : 'automatic']);
+    if (referenceMode) maybeAutoSuggest();
+    els.sampleStepLabel.innerHTML = referenceMode ? '粗い間隔 <em>coarse</em>' : '自動確認間隔';
+    updateSummary();
+  }
+
   function collectSettings() {
     return {
-      start: getNumber(els.startTime, 0), end: getNumber(els.endTime, 0), coarse_step: getNumber(els.coarseStep, 2), dense_step: getNumber(els.denseStep, .25),
-      candidate_count: clamp(Math.round(getNumber(els.candidateCount, 30)), 20, 50), identity_threshold: getNumber(els.identityThreshold, .213231), tag_threshold: getNumber(els.tagThreshold, .17), quality_min: getNumber(els.qualityMin, .15), rescue: els.rescue.checked,
+      start: getNumber(els.startTime, 0), end: getNumber(els.endTime, 0), coarse_step: state.sampleSteps.reference, auto_sample_step: state.sampleSteps.automatic, dense_step: getNumber(els.denseStep, .25),
+      candidate_count: Math.max(0, Math.round(getNumber(els.candidateCount, 0))), identity_threshold: getNumber(els.identityThreshold, .213231), tag_threshold: getNumber(els.tagThreshold, .17), quality_min: getNumber(els.qualityMin, .15), cut_quality_min: clamp(getNumber(els.cutQualityMin, .55), 0, 1), rescue: els.rescue.checked,
       identity_weight: getNumber(els.identityWeight, .35), condition_weight: getNumber(els.conditionWeight, .3), quality_weight: getNumber(els.qualityWeight, .35),
       logo_removal: logoRemovalEnabled(), logo_profiles: selectedLogoProfiles(),
     };
@@ -871,6 +1272,7 @@
         const terminal = ['done', 'cancelled', 'error'].includes(data.status);
         showProgress(progress, state.job.cancelRequested && !terminal ? 'キャンセル要求済み · 処理終了を待機中…' : data.message || statusLabel(data.status));
         if (data.status === 'done') {
+          showRunInfo(data.run);
           state.candidates = Array.isArray(data.candidates) ? data.candidates : [];
           state.selectedIds.clear(); state.activeCandidateIndex = state.candidates.length ? 0 : -1;
           renderResults(data.warnings || [], data.stats || {}); hideProgress(); setBusy(els.analyzeButton, false); updateCancelControl(); state.pollTimer = null; return;
@@ -930,6 +1332,14 @@
       updateCancelControl();
       showNotice(`キャンセルできませんでした: ${error.message}`, 'error');
     }
+  }
+
+  function showRunInfo(run) {
+    if (!els.runInfo) return;
+    if (!run || !run.run_id) { els.runInfo.textContent = ''; return; }
+    const kind = run.reused ? '同条件の完了結果を再利用' : run.resumed_from ? `前回(${run.resumed_from})から再実行` : '新規解析';
+    els.runInfo.textContent = `run ${run.run_id} · ${kind}`;
+    els.runInfo.dataset.runId = run.run_id;
   }
 
   function showProgress(progress, message) {
@@ -999,7 +1409,11 @@
     const bbox = normalizeBox(candidate.bbox);
     if (bbox) { els.evidenceBox.classList.remove('hidden'); els.evidenceBox.style.left = `${bbox[0] * 100}%`; els.evidenceBox.style.top = `${bbox[1] * 100}%`; els.evidenceBox.style.width = `${(bbox[2] - bbox[0]) * 100}%`; els.evidenceBox.style.height = `${(bbox[3] - bbox[1]) * 100}%`; } else els.evidenceBox.classList.add('hidden');
     els.evidencePosition.textContent = `${state.activeCandidateIndex + 1} / ${state.candidates.length}`;
-    els.evidenceMeta.innerHTML = `<div class="evidence-stat"><span>時刻 / PTS</span><strong>${escapeHTML(formatTime(candidate.time))} · ${escapeHTML(String(candidate.pts ?? '—'))}</strong></div><div class="evidence-stat"><span>候補 ID / スコア</span><strong>${escapeHTML(String(candidate.id ?? state.activeCandidateIndex))} · ${formatPercent(candidate.score)}</strong></div><div class="evidence-stat"><span>同一性 / 距離</span><strong>${formatPercent(candidate.identity)} · ${formatNumber(candidate.distance)}</strong></div><div class="evidence-stat"><span>画質 / 状態</span><strong>${formatPercent(candidate.quality)} · ${formatPercent(candidate.condition)}</strong></div>${tagEvidence(candidate.tags)}`;
+    const automaticEvidence = candidate.selection_mode === 'automatic_character';
+    const scoreEvidence = automaticEvidence
+      ? `<div class="evidence-stat"><span>キャラクター候補 / カット品質</span><strong>${formatPercent(candidate.presence_score)} · ${formatPercent(candidate.cut_quality)}</strong></div><div class="evidence-stat"><span>近似重複 group</span><strong>${escapeHTML(String(candidate.group_id || '—'))}</strong></div>`
+      : `<div class="evidence-stat"><span>同一性 / 距離</span><strong>${formatPercent(candidate.identity)} · ${formatNumber(candidate.distance)}</strong></div><div class="evidence-stat"><span>画質 / 状態</span><strong>${formatPercent(candidate.quality)} · ${formatPercent(candidate.condition)}</strong></div>`;
+    els.evidenceMeta.innerHTML = `<div class="evidence-stat"><span>時刻 / PTS</span><strong>${escapeHTML(formatTime(candidate.time))} · ${escapeHTML(String(candidate.pts ?? '—'))}</strong></div><div class="evidence-stat"><span>候補 ID / スコア</span><strong>${escapeHTML(String(candidate.id ?? state.activeCandidateIndex))} · ${formatPercent(candidate.score)}</strong></div>${scoreEvidence}${tagEvidence(candidate.tags)}`;
     document.querySelectorAll('.candidate-card').forEach((card) => card.classList.toggle('active', Number(card.dataset.index) === state.activeCandidateIndex));
   }
 
@@ -1024,9 +1438,10 @@
     invalidateLogoPreview();
     const preview = candidate.preview_url || candidate.crop_url || '';
     const crop = candidate.crop_url || preview;
+    const cropLabel = candidate.selection_mode === 'automatic_character' ? 'タグ確認対象（全フレーム）' : '対象 crop（解析領域・元映像）';
     const bbox = normalizeBox(candidate.bbox);
     const candidateId = String(candidate.id ?? state.activeCandidateIndex);
-    els.compareContent.innerHTML = `<div class="single-preview-pane" data-candidate-id="${escapeAttribute(candidateId)}"><div class="single-preview-images"><div class="single-preview-main"><img src="${escapeAttribute(preview)}" alt="候補 ${escapeAttribute(formatTime(candidate.time))}の元フレーム"><span class="single-preview-bbox" style="${bbox ? `left:${bbox[0] * 100}%;top:${bbox[1] * 100}%;width:${(bbox[2] - bbox[0]) * 100}%;height:${(bbox[3] - bbox[1]) * 100}%` : 'display:none'}"></span></div><div class="single-preview-target"><span>対象 crop（解析領域・元映像）</span><img src="${escapeAttribute(crop)}" alt="候補 ${escapeAttribute(formatTime(candidate.time))}の対象crop（元映像）"></div></div><div class="single-preview-actions"><button id="logoPreviewButton" class="ghost-button" type="button">ロゴ除去をプレビュー</button><span id="logoPreviewSetting" class="logo-preview-setting"></span></div><div id="logoPreviewStatus" class="logo-preview-status" role="status"></div><div id="logoPreviewResult" class="logo-preview-result hidden"><div class="logo-preview-views"><figure><figcaption>元フレーム（保存用）</figcaption><img id="logoPreviewOriginal" alt="元フレーム（保存用）"></figure><figure><figcaption id="logoPreviewCleanLabel">AI補完後（ロゴ除去）</figcaption><img id="logoPreviewClean" alt="AI補完後（ロゴ除去）"><div id="logoPreviewCleanPlaceholder" class="logo-preview-placeholder hidden">元フレームを保持しました</div></figure></div><div id="logoPreviewMeta" class="logo-preview-meta"></div><div id="logoPreviewWarnings" class="logo-preview-warnings"></div></div><div class="single-preview-meta"><strong>${escapeHTML(formatTime(candidate.time))}</strong><span>PTS ${escapeHTML(String(candidate.pts ?? '—'))}</span><span>ID ${escapeHTML(String(candidate.id ?? '—'))}</span><span>スコア ${formatPercent(candidate.score)}</span><p>${escapeHTML(evidenceLine(candidate))}</p>${tagEvidence(candidate.tags)}</div></div>`;
+    els.compareContent.innerHTML = `<div class="single-preview-pane" data-candidate-id="${escapeAttribute(candidateId)}"><div class="single-preview-images"><div class="single-preview-main"><img src="${escapeAttribute(preview)}" alt="候補 ${escapeAttribute(formatTime(candidate.time))}の元フレーム"><span class="single-preview-bbox" style="${bbox ? `left:${bbox[0] * 100}%;top:${bbox[1] * 100}%;width:${(bbox[2] - bbox[0]) * 100}%;height:${(bbox[3] - bbox[1]) * 100}%` : 'display:none'}"></span></div><div class="single-preview-target"><span>${escapeHTML(cropLabel)}</span><img src="${escapeAttribute(crop)}" alt="候補 ${escapeAttribute(formatTime(candidate.time))}の${escapeAttribute(cropLabel)}"></div></div><div class="single-preview-actions"><button id="logoPreviewButton" class="ghost-button" type="button">ロゴ除去をプレビュー</button><span id="logoPreviewSetting" class="logo-preview-setting"></span></div><div id="logoPreviewStatus" class="logo-preview-status" role="status"></div><div id="logoPreviewResult" class="logo-preview-result hidden"><div class="logo-preview-views"><figure><figcaption>元フレーム（保存用）</figcaption><img id="logoPreviewOriginal" alt="元フレーム（保存用）"></figure><figure><figcaption id="logoPreviewCleanLabel">AI補完後（ロゴ除去）</figcaption><img id="logoPreviewClean" alt="AI補完後（ロゴ除去）"><div id="logoPreviewCleanPlaceholder" class="logo-preview-placeholder hidden">元フレームを保持しました</div></figure></div><div id="logoPreviewMeta" class="logo-preview-meta"></div><div id="logoPreviewWarnings" class="logo-preview-warnings"></div></div><div class="single-preview-meta"><strong>${escapeHTML(formatTime(candidate.time))}</strong><span>PTS ${escapeHTML(String(candidate.pts ?? '—'))}</span><span>ID ${escapeHTML(String(candidate.id ?? '—'))}</span><span>スコア ${formatPercent(candidate.score)}</span><p>${escapeHTML(evidenceLine(candidate))}</p>${tagEvidence(candidate.tags)}</div></div>`;
     const button = document.getElementById('logoPreviewButton');
     button.addEventListener('click', () => previewLogoForCandidate(candidate));
     updateLogoPreviewControls();
@@ -1265,7 +1680,7 @@
     if (event.code === 'Space' && state.activeCandidateIndex >= 0) { event.preventDefault(); const candidate = state.candidates[state.activeCandidateIndex]; const id = String(candidate.id ?? state.activeCandidateIndex); toggleCandidate(id, !state.selectedIds.has(id)); const card = document.querySelector(`.candidate-card[data-id="${cssEscape(id)}"] input`); if (card) card.checked = state.selectedIds.has(id); }
   }
 
-  function updateSummary() { els.summaryReference.textContent = `${state.references.length}枚`; els.summaryTags.textContent = `${state.wanted.length + state.avoided.length}件`; }
+  function updateSummary() { els.summaryReference.textContent = currentSelectionMode() === 'automatic' ? '自動' : `${state.references.length}枚`; els.summaryTags.textContent = `${state.wanted.length + state.avoided.length}件`; }
   function updateCaptureAvailability() {
     els.captureReference.disabled = !state.currentVideo || state.videoLoading || state.captureLoading;
     els.captureReference.setAttribute('aria-busy', state.videoLoading || state.captureLoading ? 'true' : 'false');
@@ -1308,6 +1723,7 @@
     insufficient_matching_frames: '一致するフレームが不足しています',
   };
   function shortageMessage(stats, count) {
+    if (!count && stats && stats.selection_mode === 'automatic_character') return 'キャラクターと判定できる候補がありませんでした。サンプル間隔を短くして再試行してください。';
     if (!count) return '条件に合う候補が見つかりませんでした。タグ閾値や画質下限を下げて再試行してください。';
     if (stats && (stats.shortage || stats.shortage_warning || stats.shortage_reason)) {
       return humanizeShortage(stats.shortage_warning || stats.shortage_reason, stats.shortage);
@@ -1329,7 +1745,12 @@
     const parsedCount = Number.isFinite(Number(count)) && Number(count) > 0 ? Number(count) : ((text.match(/(\d+)\s*(?:candidate|候補)/i) || [])[1] ? Number((text.match(/(\d+)\s*(?:candidate|候補)/i) || [])[1]) : 0);
     return parsedCount > 0 ? `${copy}（${parsedCount}件不足）` : copy;
   }
-  function evidenceLine(candidate) { return `同一性 ${formatPercent(candidate.identity)} · 画質 ${formatPercent(candidate.quality)} · 状態 ${formatPercent(candidate.condition)}`; }
+  function evidenceLine(candidate) {
+    const label = candidate && candidate.character_key ? `${characterLabel(candidate.character_key)} · ` : '';
+    if (label) return `${label}同一性 ${formatPercent(candidate.identity)} · 画質 ${formatPercent(candidate.quality)} · 状態 ${formatPercent(candidate.condition)}`;
+    if (candidate && candidate.selection_mode === 'automatic_character') return `キャラクター ${formatPercent(candidate.presence_score)} · カット品質 ${formatPercent(candidate.cut_quality)}`;
+    return `同一性 ${formatPercent(candidate.identity)} · 画質 ${formatPercent(candidate.quality)} · 状態 ${formatPercent(candidate.condition)}`;
+  }
   function tagSnippet(tags) {
     const flattened = flattenCandidateTags(tags).sort((left, right) => right.confidence - left.confidence).slice(0, 3);
     return flattened.map((item) => `<span title="${escapeAttribute(`${item.scope === 'subject' ? '対象' : 'フレーム'}: ${item.tag}`)}"><b>${item.scope === 'subject' ? '対象' : 'フレーム'}</b> ${escapeHTML(item.tag)} ${formatPercent(item.confidence)}</span>`).join('');

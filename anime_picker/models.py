@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import ast
 from contextlib import nullcontext
+import gc
 import hashlib
 import importlib
 import json
@@ -27,6 +28,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -252,9 +254,17 @@ class ModelService:
     identity_model = IDENTITY_MODEL
     threshold = IDENTITY_THRESHOLD
 
-    def __init__(self, model_root: Path | str | None = None, require_gpu: bool = True) -> None:
+    def __init__(
+        self,
+        model_root: Path | str | None = None,
+        require_gpu: bool = True,
+        runtime_cache_root: Path | str | None = None,
+    ) -> None:
         self.model_root = _root_from_argument(model_root)
         self.root = self.model_root
+        self.runtime_cache_root = (
+            Path(runtime_cache_root) if runtime_cache_root is not None else self.model_root / "cache"
+        )
         self.require_gpu = bool(require_gpu)
         self._manifest = _read_json(self.model_root / "manifest.json")
         self.manifest_revision = self._manifest_revision(self._manifest)
@@ -266,6 +276,11 @@ class ModelService:
         self._runtime_checked = False
         self._runtime_error: str | None = None
         self._tag_vocabulary: dict[str, str] | None = None
+        self._model_telemetry: dict[str, dict[str, float | int]] = {
+            name: {"calls": 0, "seconds": 0.0}
+            for name in ("runtime_init", "detector", "ccip_embed", "ccip_distance", "pixai_tag")
+        }
+        self._closed = False
         self._configure_cache_env()
 
     @property
@@ -364,7 +379,7 @@ class ModelService:
     def _configure_cache_env(self) -> None:
         # Override inherited cache settings so an inference process cannot
         # accidentally fetch or read model material outside the prescribed root.
-        cache_root = self.model_root / "cache"
+        cache_root = self.runtime_cache_root
         paths = {
             "HF_HOME": cache_root / "huggingface",
             "HF_HUB_CACHE": cache_root / "huggingface" / "hub",
@@ -477,6 +492,7 @@ class ModelService:
             if self._runtime_error:
                 raise ModelUnavailable(self._runtime_error)
             return
+        started = time.perf_counter()
         self._runtime_checked = True
         # Import and touch PyTorch first.  On Windows this loads the CUDA DLLs
         # before ONNX Runtime gets imported, which avoids a common provider
@@ -511,6 +527,8 @@ class ModelService:
             os.environ["ONNX_MODE"] = "gpu"
         else:
             os.environ["ONNX_MODE"] = "cpu"
+        self._model_telemetry["runtime_init"]["calls"] += 1
+        self._model_telemetry["runtime_init"]["seconds"] += time.perf_counter() - started
 
     def _patch_imgutils_modules(self) -> None:
         modules = (
@@ -625,7 +643,7 @@ class ModelService:
             "image_processor": str(path),
             "trust_remote_code": True,
             "local_files_only": True,
-            "cache_dir": str(self.model_root / "cache" / "huggingface"),
+            "cache_dir": str(self.runtime_cache_root / "huggingface"),
             "device": 0 if self.require_gpu else -1,
         }
         try:
@@ -725,6 +743,7 @@ class ModelService:
     def detect(self, image: Any) -> list[dict[str, Any]]:
         """Detect anime people and, when available, anime heads in pixel space."""
 
+        started = time.perf_counter()
         self._ensure_detector()
         width, height = _image_size(image)
         try:
@@ -751,6 +770,8 @@ class ModelService:
                 if parsed is not None:
                     parsed["kind"] = "head"
                     result.append(parsed)
+        self._model_telemetry["detector"]["calls"] += 1
+        self._model_telemetry["detector"]["seconds"] += time.perf_counter() - started
         return result
 
     def embed(self, images: list[Any]) -> np.ndarray:
@@ -758,6 +779,7 @@ class ModelService:
 
         if not images:
             return np.empty((0, 0), dtype=np.float32)
+        started = time.perf_counter()
         self._ensure_ccip(need_extract=True)
         if not callable(ccip_batch_extract_features):
             raise ModelUnavailable("imgutils ccip_batch_extract_features is unavailable")
@@ -770,11 +792,14 @@ class ModelService:
             array = array.reshape(1, -1)
         if array.ndim != 2 or array.shape[0] != len(images):
             raise ModelError(f"CCIP feature extractor returned {array.shape}; expected ({len(images)}, features)")
+        self._model_telemetry["ccip_embed"]["calls"] += 1
+        self._model_telemetry["ccip_embed"]["seconds"] += time.perf_counter() - started
         return array
 
     def distance(self, ref_features: np.ndarray, features: np.ndarray) -> np.ndarray:
         """Return the official CCIP distance matrix (references x images)."""
 
+        started = time.perf_counter()
         refs = np.asarray(ref_features, dtype=np.float32)
         values = np.asarray(features, dtype=np.float32)
         if refs.ndim == 1:
@@ -798,7 +823,10 @@ class ModelService:
             expected = combined.shape[0]
             if matrix.shape != (expected, expected):
                 raise ModelError(f"CCIP distance function returned {matrix.shape}; expected {(expected, expected)}")
-            return matrix[: refs.shape[0], refs.shape[0] :].astype(np.float32, copy=False)
+            result = matrix[: refs.shape[0], refs.shape[0] :].astype(np.float32, copy=False)
+            self._model_telemetry["ccip_distance"]["calls"] += 1
+            self._model_telemetry["ccip_distance"]["seconds"] += time.perf_counter() - started
+            return result
         if not callable(ccip_difference):
             raise ModelUnavailable("imgutils CCIP distance functions are unavailable")
         output = np.empty((refs.shape[0], values.shape[0]), dtype=np.float32)
@@ -809,6 +837,8 @@ class ModelService:
                 except TypeError:
                     distance = ccip_difference(reference, value)  # type: ignore[misc]
                 output[row, column] = _safe_float(distance, math.inf)
+        self._model_telemetry["ccip_distance"]["calls"] += 1
+        self._model_telemetry["ccip_distance"]["seconds"] += time.perf_counter() - started
         return output
 
     def _normalise_tags(self, raw: Any) -> dict[str, dict[str, float]]:
@@ -853,6 +883,7 @@ class ModelService:
     def tag(self, image: Any) -> dict[str, dict[str, float]]:
         """Return low-cutoff PixAI scores grouped by the model's categories."""
 
+        started = time.perf_counter()
         tagger = self._load_tagger()
         precision = self.tag_precision
         try:
@@ -875,7 +906,134 @@ class ModelService:
             if precision == "bfloat16" and self.require_gpu:
                 raise ModelError(f"CUDA bfloat16 PixAI inference failed; refusing CPU fallback: {error}") from error
             raise
-        return self._normalise_tags(raw)
+        result = self._normalise_tags(raw)
+        self._model_telemetry["pixai_tag"]["calls"] += 1
+        self._model_telemetry["pixai_tag"]["seconds"] += time.perf_counter() - started
+        return result
+
+    def tag_many(self, images: Iterable[Any], batch_size: int = 8) -> list[dict[str, dict[str, float]]]:
+        """Tag images in one local pipeline call, preserving their input order.
+
+        ``batch_size`` is passed through to the Transformers pipeline, which
+        bounds the number of images resident in a model batch.  A batch result
+        must contain exactly one row per input; ambiguous or truncated output
+        is an error rather than silently shifting image-to-tag alignment.
+        """
+
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        image_list = list(images)
+        if not image_list:
+            return []
+
+        started = time.perf_counter()
+        tagger = self._load_tagger()
+        precision = self.tag_precision
+        try:
+            torch_module = importlib.import_module("torch") if precision == "bfloat16" else None
+            autocast = (
+                torch_module.autocast(device_type="cuda", dtype=torch_module.bfloat16)
+                if torch_module is not None
+                else nullcontext()
+            )
+            inference = torch_module.inference_mode() if torch_module is not None else nullcontext()
+            with inference, autocast:
+                raw = tagger(
+                    image_list,
+                    threshold=0.0,
+                    min_threshold=0.0,
+                    batch_size=batch_size,
+                )
+        except Exception as error:
+            if precision == "bfloat16" and self.require_gpu:
+                raise ModelError(f"CUDA bfloat16 PixAI batch inference failed; refusing CPU fallback: {error}") from error
+            raise
+
+        if isinstance(raw, Mapping):
+            batch_rows = raw.get("results")
+            if len(image_list) > 1 and isinstance(batch_rows, Sequence) and not isinstance(
+                batch_rows, (str, bytes, bytearray)
+            ):
+                raw_rows = list(batch_rows)
+            elif len(image_list) == 1:
+                raw_rows = [raw]
+            else:
+                raise ModelError(
+                    f"PixAI batch returned one result object for {len(image_list)} images; expected one row per image"
+                )
+        elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+            raw_rows = list(raw)
+        else:
+            raw_rows = [raw] if len(image_list) == 1 else []
+
+        if len(raw_rows) != len(image_list):
+            raise ModelError(
+                f"PixAI batch returned {len(raw_rows)} result rows for {len(image_list)} images"
+            )
+        results = [self._normalise_tags(row) for row in raw_rows]
+        self._model_telemetry["pixai_tag"]["calls"] += len(image_list)
+        self._model_telemetry["pixai_tag"]["seconds"] += time.perf_counter() - started
+        return results
+
+    def telemetry(self) -> dict[str, Any]:
+        """Return per-model API timing counters accumulated by this service."""
+
+        return {name: dict(values) for name, values in self._model_telemetry.items()}
+
+    def close(self) -> dict[str, Any]:
+        """Release model references and idle CUDA caches for this process."""
+
+        if self._closed:
+            return {"performed": False, "already_closed": True, "model_telemetry": self.telemetry()}
+        started = time.perf_counter()
+        cleared: list[str] = []
+        errors: list[str] = []
+        self._tagger = None
+        for module_name in ("imgutils.metrics.ccip", "imgutils.generic.yolo", "imgutils.detect.person", "imgutils.detect.head"):
+            module = sys.modules.get(module_name)
+            if module is None:
+                continue
+            for name in ("_open_feat_model", "_open_metric_model", "open_onnx_model", "_open_model"):
+                opener = getattr(module, name, None)
+                clear = getattr(opener, "cache_clear", None)
+                if callable(clear):
+                    try:
+                        clear()
+                        cleared.append(f"{module_name}.{name}")
+                    except Exception as error:
+                        errors.append(f"{module_name}.{name}: {error}")
+        self._ccip_module = None
+        gc.collect()
+        cuda_before: dict[str, Any] = {"available": False}
+        cuda_after: dict[str, Any] = {"available": False}
+        try:
+            torch_module = importlib.import_module("torch")
+            if torch_module.cuda.is_available():
+                device = torch_module.cuda.current_device()
+                torch_module.cuda.synchronize(device)
+                cuda_before = {
+                    "allocated_bytes": int(torch_module.cuda.memory_allocated(device)),
+                    "reserved_bytes": int(torch_module.cuda.memory_reserved(device)),
+                }
+                torch_module.cuda.empty_cache()
+                torch_module.cuda.synchronize(device)
+                cuda_after = {
+                    "allocated_bytes": int(torch_module.cuda.memory_allocated(device)),
+                    "reserved_bytes": int(torch_module.cuda.memory_reserved(device)),
+                }
+        except Exception as error:
+            errors.append(f"torch CUDA cleanup: {error}")
+        self._closed = True
+        return {
+            "performed": True,
+            "seconds": time.perf_counter() - started,
+            "model_telemetry": self.telemetry(),
+            "onnx_cache_entries_cleared": cleared,
+            "cuda_before_empty_cache": cuda_before,
+            "cuda_after_empty_cache": cuda_after,
+            "errors": errors,
+            "note": "empty_cache releases unused allocator blocks only; live tensors remain allocated",
+        }
 
     def diagnostics(self) -> dict[str, Any]:
         """Report runtime, provider, and local bundle evidence for ``doctor``."""
@@ -904,7 +1062,7 @@ class ModelService:
             "onnx_available_providers": [],
             "onnx_active_providers": [],
             "cuda_execution_provider_active": False,
-            "cache_root": str(self.model_root / "cache"),
+            "cache_root": str(self.runtime_cache_root),
         }
         try:
             torch_module = importlib.import_module("torch")
